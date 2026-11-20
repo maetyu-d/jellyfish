@@ -1,0 +1,10 @@
+--- a/lang/LangSource/SC_WeldLangBridge.cpp
++++ b/lang/LangSource/SC_WeldLangBridge.cpp
+@@ -653,3 +653,7 @@
+             setError(errorBuffer, errorBufferSize, "embedded sclang produced an empty score");
+         return false;
+     }
++
++    setError(errorBuffer, errorBufferSize, "");
++    return true;
++}

@@ -1,0 +1,41 @@
+diff --git a/server/scsynth/SC_CoreAudio.h b/server/scsynth/SC_CoreAudio.h
+index 27a8d8b..a6a4fd8 100644
+--- a/server/scsynth/SC_CoreAudio.h
++++ b/server/scsynth/SC_CoreAudio.h
+@@ -24,5 +24,6 @@
+ #include "SC_SyncCondition.h"
+ #include "PriorityQueue.h"
++#include <atomic>
+ #include <optional>
+ 
+ #include <SC_Lock.h>
+@@ -155,7 +156,7 @@ protected:
+     EngineFifo mOscPacketsToEngine;
+     SC_SyncCondition mAudioSync;
+     SC_Thread mThread;
+-    bool mRunThreadFlag;
++    std::atomic<bool> mRunThreadFlag { false };
+     uint32 mSafetyOffset;
+     PriorityQueueT<SC_ScheduledEvent, 2048> mScheduler;
+     int mNumSamplesPerCallback;
+diff --git a/server/scsynth/SC_CoreAudio.cpp b/server/scsynth/SC_CoreAudio.cpp
+index 0ba622f..29af0b6 100644
+--- a/server/scsynth/SC_CoreAudio.cpp
++++ b/server/scsynth/SC_CoreAudio.cpp
+@@ -350,8 +350,13 @@ void SC_AudioDriver::RunThread() {
+     DeleteGraphDefsFifo* deletegraphfifo = &mWorld->hw->mDeleteGraphDefs;
+ 
+-    while (mRunThreadFlag) {
+-        // wait for sync
+-        mAudioSync.WaitNext();
++    while (mRunThreadFlag.load(std::memory_order_acquire)) {
++        // WaitEach tests the live sequence counter after every wake. WaitNext
++        // resets that counter, and WaitOnce snapshots it before sleeping; both
++        // can lose Stop()'s signal in their respective notify-before-wait
++        // windows and leave World_Cleanup blocked forever in thread::join().
++        mAudioSync.WaitEach();
++        if (!mRunThreadFlag.load(std::memory_order_acquire))
++            break;
+ #ifdef SC_BELA
+         rt_print_flush_buffers();
+ #endif // SC_BELA

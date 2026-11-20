@@ -1,0 +1,21 @@
+{
+  "name": "SuperCollider App Engine",
+  "version": "0.2.0",
+  "abi_version": 1,
+  "package_kind": "host-neutral-native-audio-engine",
+  "created": "2026-08-28",
+  "prebuilt_target": {
+    "os": "macOS",
+    "architecture": "arm64"
+  },
+  "public_header": "include/sc_app_engine.h",
+  "shared_library": "lib/libsc_app_engine.dylib",
+  "static_library": "lib/libsc_app_engine.a",
+  "runtime": "runtime/supercollider",
+  "synthdefs": "supercollider/synthdefs",
+  "source": "src",
+  "supercollider_revision": "ae4ddb74ba5baacc94509fb671913458b8a07299",
+  "godot_dependency": false,
+  "audio_format": "interleaved stereo float32",
+  "active_engines_per_process": 1
+}

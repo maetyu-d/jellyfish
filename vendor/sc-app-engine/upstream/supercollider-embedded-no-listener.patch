@@ -1,0 +1,21 @@
+--- a/lang/LangPrimSource/OSCData.cpp
++++ b/lang/LangPrimSource/OSCData.cpp
+@@ -879,6 +879,7 @@
+ #endif
+ 
+     startAsioThread();
++    if (port < 0) return; // Embedded language clients can opt out of binding a UDP socket.
+     try {
+         gUDPport = std::make_unique<InPort::UDP>(port, HandlerType::OSC);
+     } catch (std::exception const& e) { postfl("No networking: %s", e.what()); }
+--- a/lang/LangSource/SC_WeldLangBridge.cpp
++++ b/lang/LangSource/SC_WeldLangBridge.cpp
+@@ -344,7 +344,7 @@
+         SC_LanguageClient::Options options;
+         if (runtimeDirectory != nullptr)
+             options.mRuntimeDir = runtimeDirectory;
+-        options.mPort = 0;
++        options.mPort = -1;
+         bridgeClient()->initRuntime(options);
+     }
+ 
