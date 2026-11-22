@@ -4,15 +4,20 @@ A native C++ exploration game. You are a giant jellyfish swimming beneath the li
 
 The jellyfish have iridescent, scalloped bells, internal anatomy and branching canals. Folded oral arms grow from the web beneath the bell, and fine tentacles emerge in clusters under its scalloped edge. Their membranes bend the colours in nearby starlight, streams and trails by different amounts. Comb jellies carry rippling rows of light along their bodies, and suspended light drifts past at different depths as you swim.
 
-The eight named currents are entry points into 7,714 solar systems. Press N within the atlas to enter the uncharted catalogue. The atmosphere evolves as you swim, with different kinds of jellyfish, orbital bodies, and a continuously synthesised score in each of four waters.
+The eight named currents are entry points into 7,714 solar systems. Press N within the atlas to enter the uncharted catalogue. The water colours, light and planets morph continuously, reaching a new environment every 30–60 seconds. Selecting a current from the atlas starts a 12-second morph. You can keep swimming through both changes, and the shoal and its trails stay in place.
 
 ## Playing
 
 Open **PelagicOrbits.app** on an Apple Silicon Mac running macOS 15 or later. Its bundled SuperCollider engine synthesises the score and creature sounds live and works offline.
 
+The swim view is text-free. Open the atlas with **Tab** to see the named currents.
+
+Sink into dark water with **Q** or rise into richer colour with **E**. Look up to see the moon through the illuminated water.
+
 | Control | Action |
 | --- | --- |
 | Arrow keys | Swim forward, back or sideways |
+| B | Hold to brake and drift with the water |
 | Q / E | Sink / rise |
 | Move the mouse or use I / J / K / L | Look around |
 | Esc | Release the pointer. Click the water to look with the mouse again. |
@@ -20,20 +25,29 @@ Open **PelagicOrbits.app** on an Apple Silicon Mac running macOS 15 or later. It
 | Hold and release F or the mouse button | Contract your bell and call a nearby crown jellyfish alongside |
 | N | Move to the next current |
 | Tab | Open or close the atlas. Choose a current by clicking it or pressing 1–8. Press N here for an uncharted system. |
-| D | Toggle hands-free drift. In Noctiluca this follows the opening swim. |
+| D | Toggle hands-free drift. Swim or brake to take over. |
 | Space | Pause / resume |
-| H | Hide / show the HUD |
+| P | Cycle through the four graphics modes |
+| V | View the enclosing jellyfish from outside or return to your swimmer |
 | M | Mute / unmute audio |
 
-Noctiluca opens in quiet water with a solitary crown. Follow the fine cyan strands of the current through the Narrows. A giant crown crosses overhead near the mouth of the passage, hiding the star behind its bell and bending the water below. Look up as the light travels from its rim into its tentacles. Lantern Basin opens in layers as you swim forward. The nearest shoals light up in yellow-green, then turquoise and blue shoals appear deeper in the water. Look past the small jellyfish towards the dark bell at the far end of the basin. You can swim out to it and pass beneath its tentacles. The hands-free route takes about three minutes, including time to drift among the shoals after the encounter.
+**Hybrid Water** is selected at launch. It layers the original water at 50% opacity over a brushed ground. Turquoise, violet and pink travel through the painted currents and the jellyfish catch shifting iridescence. Choose **Original Graphics** or **Painted World** from the **View** menu to compare the looks.
+
+**View → Adaptive Resolution** is on at launch. It adjusts the resolution and mesh detail underwater to reduce GPU load. Turn it off for the full-detail view.
+
+**View → Ultra High Graphics** uses native drawable resolution, finer bell and tentacle meshes, and four-sample antialiasing for jellyfish on supported GPUs.
+
+You start in the violet water of Lantern Basin, inside the largest jellyfish and facing the amber bell of the next giant. Look up to see the outer bell's luminous canals or press **V** to view it from the space-like water with its planets and stars. Follow the current through five progressively smaller bells, passing from the Amber Garden into the Cobalt Gloam, the Viridian Fold and the Carmine Deep. Follow the gold current into the cyan water of the smallest bell. A vertical shaft rises from the final whirlpool and grows brighter and taller as you approach. Its eye kindles your jellyfish’s solar system and grows brighter as you stay inside. Hold your position for two seconds to grow into the largest jellyfish. Three contractions send luminous wakes and clouds of plankton curling out from its rim. A current carries you through the bell membrane and back to the original swimmer in Lantern Basin. The system you kindled becomes the next cycle’s sky. You can swim back through the same openings or turn away from the first bell to explore the Narrows. Press **D** to follow the whole cycle hands-free.
+
+Near the start, the amber giant contracts and sends a wave out into the basin. Let the crest pass and ride the water it draws back towards the bell. The Amber Garden lifts you, the Cobalt Gloam carries you sideways, and the shoals in the Viridian Fold bend the flow around them. The water rolls down through the Carmine Deep and settles around the eye. The planet that forms there keeps its ring tilt and tint when it becomes part of the next cycle's sky. Listen for the same three notes as you return.
 
 Moon jellyfish relay a quick pulse to their neighbours. Comb jellyfish answer with a slower ripple. A held call draws one nearby crown across your path and alongside for a while. Its reply sounds from the side where it is swimming. As you pass close to each other, your wakes leave a pair of braided filaments.
 
-Swimming builds momentum with each bell contraction. Moving plankton and pulses of light show which way the current runs. Release the controls inside the stream and the water carries you through the bends. Tentacles lag behind a change of speed or direction and leave luminous streaks at their previous positions. The streaks soften and fade over about six seconds. The camera can orbit independently while the jellyfish turns towards its swimming direction.
+Your bell contracts more strongly as you swim, and your body banks as you turn. Release the controls to glide or hold **B** to shed speed and match the local current. Moving plankton and pulses of light show which way the water runs. Tentacles lag behind changes in speed and direction and leave luminous streaks that soften over about six seconds. The camera can orbit independently while the jellyfish turns towards its swimming direction.
 
 ## Music
 
-The embedded score shifts its tuning and colour as you cross between the four waters. The current changes its texture, a quick pulse rings a bell, a held call produces a lower gliding tone, and shoal replies echo across the stereo field.
+The embedded score shifts its tuning and colour as you cross between the nested and open waters. The current changes its texture, a quick pulse rings a bell, a held call produces a lower gliding tone, and shoal replies echo across the stereo field.
 
 The ocean responds to three frequency bands in the engine’s stereo output, using the approach developed for Crimson Mirror / Prism Currents. Bass swells the water ribbons, mids bend them, treble brings out fine detail in the jellyfish and wakes, and attacks send brief glints along the current. **Music → Music-Reactive Ocean** toggles the visual response.
 

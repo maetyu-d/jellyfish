@@ -3,8 +3,10 @@
 #include <algorithm>
 #include <cmath>
 #include <fstream>
+#include <memory>
 #include <numbers>
 #include <stdexcept>
+#include <utility>
 
 namespace pelagic {
 namespace {
@@ -16,10 +18,13 @@ constexpr unsigned ticksPerTrailSample = 9;
 // Retain two completely dark samples for interpolation and one spare for retirement.
 static_assert((trailSamples-3)*ticksPerTrailSample*physicsStep > trailLifetime);
 constexpr float holdSeconds = .57f;
+constexpr float shortestMorphSeconds = 30.f, longestMorphSeconds = 60.f;
+constexpr float manualMorphSeconds = 12.f;
 constexpr float pulseSpeed = 10.6f;
 constexpr float drawSpeed = 8.1f;
-constexpr unsigned moon = 0, crown = 1, comb = 2;
+constexpr unsigned moon = 0, crown = 1, comb = 2, petal = 3, lantern = 4, seaBell = 5;
 constexpr float playerSize = 2.65f;
+constexpr float playerSpeedScale = .5f;
 constexpr float shoalHalfWidth = 62.f, shoalHalfHeight = 38.f;
 constexpr float shoalBehind = 62.f, shoalAhead = 93.f;
 constexpr float streamSpacing = 46.f, eddySpacing = 44.f;
@@ -28,6 +33,47 @@ constexpr std::size_t eclipseGiant = 2;
 constexpr std::size_t basinGiant = 3;
 constexpr float basinGiantSize = 13.6f;
 constexpr float eclipseStation = 166.f;
+constexpr std::array<std::size_t,bellPassageCount> bellAnimals{basinGiant,32,39,46,52};
+constexpr unsigned whirlpoolDepth = bellPassageCount;
+constexpr std::size_t whirlpoolHost = bellAnimals.back();
+constexpr float whirlpoolReach = 4.8f, whirlpoolEye = 1.25f;
+constexpr float eyeHoldSeconds = 2.f, transformationSeconds = 18.f, returnSeconds = 8.f;
+constexpr float returnTravelSeconds = 6.65f;
+constexpr float openingStrokeTime = 5.8f, openingWaveSpeed = 18.f;
+constexpr std::size_t viridianFirst = bellAnimals[3]+1, viridianEnd = bellAnimals[4];
+// The enclosing sky comes first, followed by the traversable bells in order.
+constexpr std::array<unsigned,1+bellPassageCount> bellCatalogueIds{70,276,84,464,282,470};
+constexpr std::array<float,1+bellPassageCount> swimmerScales{1.f,.73f,.55f,.50f,.46f,.46f};
+constexpr std::array<unsigned,bellPassageCount> bellScorePalettes{1,2,1,3,0};
+constexpr std::array<const char*,bellPassageCount> innerNames{
+    "The Amber Garden", "The Cobalt Gloam", "The Viridian Fold", "The Carmine Deep", "The Whirlpool"
+};
+constexpr auto bellSystemSlots = [] {
+    std::array<std::size_t,trailActors> slots{};
+    for (std::size_t i = 0; i < bellAnimals.size(); ++i) slots[bellAnimals[i]] = i+1;
+    std::size_t next = bellCatalogueIds.size();
+    for (auto& slot : slots) if (slot == 0) slot = next++;
+    return slots;
+}();
+constexpr auto bellPassageByAnimal = [] {
+    std::array<unsigned,jellyfishCount> stages{};
+    for (unsigned i = 0; i < bellAnimals.size(); ++i) stages[bellAnimals[i]] = i+1;
+    return stages;
+}();
+struct BellPassage { Vec opening; float size, aperture, hue; };
+// Convert rim radii to the mesh's scale before contraction.
+constexpr float bellSize(float rimRadius) { return rimRadius/.83f; }
+constexpr std::array<BellPassage,bellPassageCount> passages{{
+    {{2.f,1.15f,280.f},bellSize(300.f),11.f,.105f},
+    {{-6.f,4.15f,354.f},bellSize(119.f),8.f,.636f},
+    {{.6f,3.4f,400.f},bellSize(48.f),6.6f,.245f},
+    {{3.f,1.15f,431.f},bellSize(20.f),5.4f,.968f},
+    {{3.5f,1.0f,448.f},bellSize(8.f),2.9f,.503f}
+}};
+constexpr float enclosingBellSize = 3200.f;
+constexpr Vec enclosingBellCentre{-.27f*enclosingBellSize,-.19f*enclosingBellSize,
+                                  .38f*enclosingBellSize};
+constexpr float basinPitch = .091f;
 constexpr std::array<Vec,giantCount> giantPositions{{
     {7.2f,-1.6f,15.7f}, {-12.4f,2.9f,23.f}, {17.8f,6.8f,39.2f}, {-26.2f,-2.6f,62.9f}
 }};
@@ -43,6 +89,16 @@ constexpr std::array<Palette, 4> palettes{{
     {{.001f,.017f,.006f}, {.008f,.36f,.032f}, {.36f,1.f,.014f}, {.025f,.15f,1.f}},
     {{.021f,.001f,.004f}, {.59f,.029f,.006f}, {1.f,.23f,.006f}, {.48f,.012f,1.f}},
     {{.024f,.001f,.035f}, {.61f,.007f,.34f}, {1.f,.82f,.008f}, {.074f,.095f,1.f}}
+}};
+constexpr Palette enclosingPalette{
+    {.020f,.003f,.057f}, {.274f,.024f,.63f}, {.68f,.24f,1.f}, {.96f,.17f,.53f}
+};
+constexpr std::array<Palette,bellPassageCount> innerPalettes{{
+    {{.046f,.012f,.002f}, {.65f,.245f,.019f}, {1.f,.69f,.10f}, {1.f,.29f,.038f}},
+    {{.004f,.008f,.057f}, {.033f,.118f,.77f}, {.26f,.52f,1.f}, {.34f,.21f,1.f}},
+    {{.014f,.043f,.003f}, {.196f,.53f,.024f}, {.68f,1.f,.17f}, {.37f,.84f,.035f}},
+    {{.051f,.002f,.018f}, {.70f,.027f,.139f}, {1.f,.21f,.37f}, {.91f,.04f,.33f}},
+    {{.002f,.033f,.044f}, {.026f,.51f,.61f}, {.27f,1.f,.95f}, {.17f,.67f,1.f}}
 }};
 
 float dot(Vec a, Vec b) { return a.x*b.x + a.y*b.y + a.z*b.z; }
@@ -69,8 +125,40 @@ float slope(float z, float from, float to) {
 struct Reach {
     Vec centre, tangent;
     float narrows, basin, flow;
+    Vec tide{};
 };
 Reach openingAt(float z) {
+    if (z > 250.f) {
+        Vec centre = passages[0].opening, tangent{0.f,0.f,1.f}, tide{};
+        constexpr std::array<Vec,bellPassageCount-1> bends{{
+            {-5.f,6.8f,0.f}, {8.8f,.65f,0.f}, {-2.8f,.8f,0.f}, {1.6f,-3.6f,0.f}
+        }};
+        constexpr std::array<Vec,bellPassageCount-1> currents{{
+            {.06f,1.62f,.25f}, {1.74f,.09f,.04f}, {0.f,.17f,.28f}, {-.37f,-1.18f,-.24f}
+        }};
+        for (unsigned i = 1; i < passages.size(); ++i) {
+            const auto& start = passages[i-1].opening;
+            const auto& end = passages[i].opening;
+            if (z < start.z) break;
+            centre = end;
+            if (z >= end.z) continue;
+            const float progress = (z-start.z)/(end.z-start.z);
+            const float arc = pi*progress;
+            const Vec offset = end-start;
+            const float swell = std::sin(arc)*std::sin(arc);
+            centre = start+offset*ease(progress)+bends[i-1]*swell;
+            tangent = offset*slope(z,start.z,end.z);
+            tangent += bends[i-1]*(pi*std::sin(2.f*arc)/(end.z-start.z));
+            tangent.z = 1.f;
+            tide = currents[i-1]*swell;
+            break;
+        }
+        centre.z = z;
+        const float narrowing = .78f*eased(z,passages[1].opening.z,passages.back().opening.z);
+        const float flow = 1.f-eased(z,196.f,253.f)+.84f*eased(z,251.f,271.f)*
+                           (1.f-eased(z,passages.back().opening.z-3.f,passages.back().opening.z+5.f));
+        return {centre,tangent,narrowing,1.f,flow,tide};
+    }
     const float first = eased(z,34.f,89.f), second = eased(z,105.f,161.f);
     const float exit = eased(z,165.f,218.f);
     const float dive = eased(z,45.f,126.f), rise = eased(z,150.f,216.f);
@@ -82,8 +170,59 @@ Reach openingAt(float z) {
             eased(z,7.f,34.f)*(1.f-eased(z,196.f,253.f))};
 }
 float openingMask(Vec p) {
-    return eased(p.z,-50.f,-12.f)*(1.f-eased(p.z,280.f,348.f))*
+    return eased(p.z,-50.f,-12.f)*(1.f-eased(p.z,490.f,573.f))*
            (1.f-eased(std::abs(p.x),30.f,67.f))*(1.f-eased(std::abs(p.y),19.f,43.f));
+}
+float apertureDistance(Vec p, const BellPassage& passage) {
+    const Vec offset = p-passage.opening;
+    return std::sqrt(offset.x*offset.x+offset.y*offset.y*1.28f);
+}
+float descentScale(float depth) {
+    const auto stage = std::min(unsigned(depth),unsigned(bellPassageCount-1));
+    return std::lerp(swimmerScales[stage],swimmerScales[stage+1],depth-float(stage));
+}
+float transformationRadius(float progress, float scale) {
+    const float small = playerSize*scale;
+    const float growth = eased(progress,.015f,.61f);
+    return growth >= 1.f ? enclosingBellSize : small*std::pow(enclosingBellSize/small,growth);
+}
+Vec basinSpawn() {
+    // Start in the enclosing sea, below its canopy and clear of the next bell's membrane.
+    return passages[0].opening+Vec{0.f,7.25f,-86.f};
+}
+Vec returnAxis() {
+    return {0.f,std::sin(basinPitch),std::cos(basinPitch)};
+}
+Vec basinCamera() {
+    const Vec axis = returnAxis();
+    return basinSpawn()-axis*10.2f-cross(axis,{1.f,0.f,0.f})*2.12f;
+}
+Vec returnInlet() {
+    // The inlet sits on the near membrane, on the approach to the original swimmer.
+    const Vec axis = returnAxis();
+    const Vec camera = basinCamera();
+    const Vec relative = (camera-enclosingBellCentre)*(1.f/enclosingBellSize);
+    const Vec p{relative.x,relative.y/.69f,relative.z};
+    const Vec d{axis.x,axis.y/.69f,axis.z};
+    const float b = dot(p,d), a = dot(d,d);
+    const float near = (b+std::sqrt(b*b+a*(1.f-dot(p,p))))/a;
+    return camera-axis*(near*enclosingBellSize);
+}
+float returnElapsed(float flight) {
+    return (1.f-flight)*returnSeconds;
+}
+float returnSteering(float flight) {
+    return eased(returnElapsed(flight),3.55f,returnTravelSeconds);
+}
+float openingContraction(float age) {
+    return eased(age,.0f,2.1f)*(1.f-eased(age,2.55f,6.1f));
+}
+float passageDistance(float seconds) {
+    // One velocity profile on both sides of the inlet, with a soft arrival at swim scale.
+    const float inside = std::max(0.f,seconds);
+    const float travel = seconds-.22f*inside*inside/(inside+1.65f);
+    const float scale = std::exp(-1.10f*travel);
+    return 5.f*scale/(4.f+scale)*(1.f-eased(seconds,3.85f,returnTravelSeconds));
 }
 float reachCore(Vec p, const Reach& reach) {
     const float dx = (p.x-reach.centre.x)/std::lerp(8.5f,5.f,reach.narrows);
@@ -107,6 +246,13 @@ Vec limited(Vec value, float cap) {
     return value * (cap / std::max(cap,length(value)));
 }
 Vec unpack(Quad value) { return {value.x,value.y,value.z}; }
+Quad blend(Quad a, Quad b, float t) {
+    return {std::lerp(a.x,b.x,t),std::lerp(a.y,b.y,t),std::lerp(a.z,b.z,t),std::lerp(a.w,b.w,t)};
+}
+Quad blendDirection(Quad a, Quad b, float t) {
+    const Quad direction = blend(a,b,t);
+    return packed(unit(unpack(direction)),direction.w);
+}
 float approachAngle(float from, float to, float amount) {
     return std::remainder(from+std::remainder(to-from,tau)*amount,tau);
 }
@@ -158,10 +304,71 @@ Vec Vec::operator*(float s) const { return {x*s,y*s,z*s}; }
 Vec& Vec::operator+=(Vec b) { return *this = *this + b; }
 
 void Ocean::updateWake(std::size_t index) {
+    if (openingRoute() && index == basinGiant) {
+        wakeFlow[index] = {};
+        return;
+    }
     const auto& giant = animals[index];
     const Vec axis = unit(giant.velocity+Vec{0,0,.26f});
     wakeFlow[index] = {axis,unit(cross({0,1,0},axis)),shoalFade(giant.p-player),
                        1.35f+.30f*std::min(2.1f,length(giant.velocity))};
+}
+
+Vec Ocean::whirlpoolCentre() const {
+    const auto& host = animals[whirlpoolHost];
+    return host.p+Vec{0.f,-.025f*host.size,.66f*host.size};
+}
+
+float Ocean::systemEmergence() const {
+    return playerSystemBirth < 0.f ? 0.f : eased(clock,playerSystemBirth,playerSystemBirth+2.15f);
+}
+
+float Ocean::transformationProgress() const {
+    return transforming() ? std::clamp((clock-transformationStart)/transformationSeconds,0.f,1.f) : 0.f;
+}
+bool Ocean::returning() const {
+    return returnElapsed(returnFlight) < returnTravelSeconds;
+}
+float Ocean::passageResonance() const {
+    return transforming() ? eased(transformationProgress(),.79f,.985f) : eased(returnFlight,.08f,.94f);
+}
+
+void Ocean::updateViridianShoals() {
+    viridianShoals = {};
+    for (std::size_t i = viridianFirst; i < viridianEnd; ++i) {
+        const auto shoal = (i-viridianFirst)%2;
+        const auto members = (viridianEnd-viridianFirst+1-shoal)/2;
+        viridianShoals[shoal] += animals[i].p*(1.f/float(members));
+    }
+}
+
+Vec Ocean::viridianWash(Vec p) const {
+    const float first = passages[2].opening.z, last = passages[3].opening.z;
+    if (p.z <= first || p.z >= last) return {};
+    Vec current{};
+    for (std::size_t i = 0; i < viridianShoals.size(); ++i) {
+        const Vec offset = p-viridianShoals[i];
+        const float d2 = dot(offset,offset);
+        const float near = 1.f-eased(d2,5.f,110.f);
+        const float turn = i == 0 ? .23f : -.23f;
+        const Vec curl{offset.z*turn,.70f-.14f*offset.y,-offset.x*turn};
+        current += curl*near;
+    }
+    return current*(eased(p.z,first,first+4.f)*(1.f-eased(p.z,last-4.f,last)));
+}
+
+void Ocean::updateOpeningStroke() {
+    if (openingStroke < 0.f && depth == 0 && !returning() &&
+        clock >= openingStrokeTime+(inheritedSky ? returnTravelSeconds : 0.f) &&
+        player.z > basinSpawn().z-28.f && player.z < passages[0].opening.z-13.f &&
+        std::abs(player.x-passages[0].opening.x) < 25.f && std::abs(player.y) < 22.f) {
+        openingStroke = clock;
+        voyageCue = {VoyageSound::OpeningStroke};
+    }
+    if (openingStroke < 0.f) return;
+    const float age = clock-openingStroke-2.15f;
+    const float strength = eased(age,0.f,.79f)*(1.f-eased(age,7.3f,10.8f));
+    openingWave = packed(passages[0].opening-Vec{0.f,0.f,openingWaveSpeed*age},strength);
 }
 
 Water Ocean::waterAt(Vec p, bool withWake, std::size_t ignoreGiant) const {
@@ -178,14 +385,16 @@ Water Ocean::waterAt(Vec p, bool withWake, std::size_t ignoreGiant) const {
         const float core = reachCore(p,reach);
         const float running = route*reach.flow*core;
         const Vec side = reach.centre-p;
-        drift += reach.tangent*(1.90f*running)+side*(.19f*running);
+        drift += reach.tangent*(1.90f*running)+side*(.19f*running)+
+                 reach.tide*(route*(.48f+.52f*core));
+        drift += viridianWash(p)*route;
         if (withWake && ignoreGiant != eclipseGiant) drift += eclipseWash(p)*route;
         channel += running;
     }
 
     const Vec turn = p-eddyCentre(p.x,p.z,clock);
     const float r2 = turn.x*turn.x+turn.z*turn.z;
-    const float spin = std::exp(-r2/75.f-turn.y*turn.y/24.f)*
+    float spin = std::exp(-r2/75.f-turn.y*turn.y/24.f)*
                        ease((eddySpacing*.5f-std::abs(turn.z))/5.f)*
                        ease((streamSpacing*.5f-std::abs(turn.x))/5.f)*(1.f-.93f*route);
     drift += Vec{turn.z,0,-turn.x}*(.49f*spin);
@@ -214,7 +423,35 @@ Water Ocean::waterAt(Vec p, bool withWake, std::size_t ignoreGiant) const {
     }
     drift = drift*(1.f-.94f*lee) + limited(wakeDrift,2.65f);
 
-    const WaterKind kind = std::max(lee,still) > .55f ? WaterKind::Still :
+    if (openingWave.w > 0.f && p.z < passages[0].opening.z) {
+        const Vec offset = p-unpack(openingWave);
+        const float reach = (1.f-eased(std::abs(offset.x),10.f,29.f))*
+                            (1.f-eased(std::abs(offset.y),6.f,16.f))*
+                            (1.f-eased(p.z,passages[0].opening.z-9.f,passages[0].opening.z));
+        const float crest = openingWave.w*reach*(1.f-eased(std::abs(offset.z),1.3f,8.f));
+        const float draw = openingWave.w*reach*eased(offset.z,2.f,13.f)*
+                           (1.f-eased(offset.z,51.f,96.f));
+        drift += Vec{-.038f*offset.x,.77f,2.84f}*draw+Vec{0.f,-.26f,-1.15f}*crest;
+        wake = std::max(wake,.76f*draw+.20f*crest);
+    }
+
+    if (route > 0.f && p.z > passages.back().opening.z-1.f) {
+        const float calm = route*eased(p.z,passages.back().opening.z-1.f,passages.back().opening.z+3.f);
+        drift = drift*(1.f-.92f*calm);
+        channel *= 1.f-.92f*calm;
+    }
+    float whirlpool = 0.f;
+    if (depth >= whirlpoolDepth-1 && ignoreGiant != whirlpoolHost) {
+        const Vec offset = p-whirlpoolCentre();
+        whirlpool = 1.f-eased(length(offset),whirlpoolEye,whirlpoolReach+2.1f);
+        const Vec circling{offset.z*.33f,-offset.y*.36f,-offset.x*.33f};
+        const float rim = eased(p.z,passages.back().opening.z-1.8f,passages.back().opening.z+1.f);
+        drift = drift*(1.f-.56f*whirlpool)+(circling*rim-offset*.27f)*whirlpool;
+        spin = std::max(spin,.51f*whirlpool);
+    }
+
+    const WaterKind kind = whirlpool > .42f ? WaterKind::Eddy :
+                           std::max(lee,still) > .55f ? WaterKind::Still :
                            wake > .49f ? WaterKind::Wake :
                            channel > .47f ? WaterKind::Stream :
                            spin > .41f && r2 > 4.f ? WaterKind::Eddy : WaterKind::Open;
@@ -234,11 +471,12 @@ Vec Ocean::eclipseWash(Vec point) const {
     return Vec{.34f*giant.velocity.x+.72f*swirl,-.44f-.19f*swirl,.28f}*strength;
 }
 
-Ocean::Ocean(const std::filesystem::path& catalogue) {
+static std::vector<System> readCatalogue(const std::filesystem::path& catalogue) {
     std::ifstream file(catalogue);
     std::string version;
     std::getline(file, version);
     if (version != "PELAGIC 1") throw std::runtime_error("The orbital catalogue could not be opened.");
+    std::vector<System> systems;
     System entry;
     while (file >> entry.id >> entry.radius >> entry.temperature >> entry.count) {
         if (entry.count > entry.orbits.size() || (!systems.empty() && entry.id <= systems.back().id))
@@ -252,44 +490,82 @@ Ocean::Ocean(const std::filesystem::path& catalogue) {
         systems.push_back(entry);
     }
     if (systems.empty()) throw std::runtime_error("The orbital catalogue is empty.");
-    visited.resize(systems.size());
-    arrive(0);
+    return systems;
 }
-void Ocean::arrive(unsigned destination) {
-    active = destination;
-    if (destination < currents.size()) {
-        const auto& locate = currents[destination];
+
+Ocean::Ocean(const std::filesystem::path& catalogue, unsigned initial, OceanStart start)
+    : Ocean(readCatalogue(catalogue),initial,start) {}
+
+Ocean::Ocean(std::vector<System> catalogue, unsigned initial, OceanStart start)
+    : systems(std::move(catalogue)) {
+    visited.resize(systems.size());
+    if (initial >= currents.size()+systems.size()) initial = 0;
+    current = destination(initial);
+    hasOpeningRoute = initial == 0;
+    std::vector<bool> assigned(systems.size());
+    for (std::size_t slot = 0; slot < bellCatalogues.size(); ++slot) {
+        const unsigned key = slot < bellCatalogueIds.size() ? bellCatalogueIds[slot] :
+                             systems[current.system].id*917u+unsigned(slot)*983u;
+        unsigned choice = unsigned(spread(key)%systems.size());
+        if (slot < bellCatalogueIds.size()) {
+            const auto found = std::lower_bound(systems.begin(),systems.end(),key,
+                                                [](const System& system,unsigned id) { return system.id < id; });
+            if (found != systems.end() && found->id == key) choice = unsigned(found-systems.begin());
+        }
+        // Preserve distinct catalogue systems when the input has enough records. A custom
+        // catalogue can run out of bodies, so its repeated records still get separate skies.
+        if (slot < systems.size())
+            while (assigned[choice]) choice = (choice+1)%systems.size();
+        assigned[choice] = true;
+        bellCatalogues[slot] = choice;
+    }
+    visited[current.system] = true;
+    if (hasOpeningRoute && start == OceanStart::ColossalBell) {
+        player = eye = basinSpawn();
+        pitch = lookPitch = basinPitch;
+        demoCalled = true;
+    }
+    const auto seed = systems[current.system].id;
+    population(seed);
+    if (openingRoute()) updateViridianShoals();
+    for (std::size_t i = 0; i < giantCount; ++i) updateWake(i);
+    for (std::size_t i = 0; i < plankton.size(); ++i) {
+        plankton[i].seed = spread(seed*31U+unsigned(i)*83U);
+        plantPlankter(i,true);
+    }
+    recordTrails();
+    startAutomaticMorph();
+}
+
+void Ocean::restartCycle() {
+    const auto previousSky = atmosphere();
+    std::unique_ptr<Ocean> next(new Ocean(std::move(systems),0,OceanStart::ColossalBell));
+    next->bellCatalogues = bellCatalogues;
+    std::swap(next->bellCatalogues[0],next->bellCatalogues[bellSystemSlots.back()]);
+    next->orbitalEpoch = orbitalEpoch+double(clock);
+    // The exterior sky remains behind the membrane as the next voyage begins.
+    next->manualSource = previousSky;
+    next->incoming = next->current;
+    next->morphEnd = shortestMorphSeconds;
+    next->manualMorph = true;
+    next->demo = demo;
+    next->returnFlight = 1.f;
+    next->inheritedSky = true;
+    next->physicsRemainder = physicsRemainder;
+    *this = std::move(*next);
+}
+Ocean::Destination Ocean::destination(unsigned number) const {
+    if (number < currents.size()) {
+        const auto& locate = currents[number];
         const auto it = std::lower_bound(systems.begin(), systems.end(), locate.id,
             [](const System& system, unsigned id) { return system.id < id; });
         if (it == systems.end() || it->id != locate.id) throw std::runtime_error("Featured system missing.");
-        index = unsigned(it - systems.begin());
-        palette = locate.palette;
-    } else {
-        index = (destination - unsigned(currents.size())) % systems.size();
-        palette = spread(systems[index].id / 400U + 672U) % palettes.size();
+        return {number,unsigned(it-systems.begin()),locate.palette};
     }
-    visited[index] = true;
-    player = {}; velocity = {}; eye = {}; tailSlip = {};
-    yaw = 0; pitch = 0; lookYaw = 0; lookPitch = 0; bodyYaw = 0;
-    lastPulse = clock-10.f; answers = 0; accent = 0;
-    companions = 0; synchronised = 0; lastCall = Call::Pulse;
-    meeting = Encounter::None;
-    crownGuest = jellyfishCount;
-    replyCount = 0;
-    demoCalled = false;
-    cancelCall();
-    population();
-    for (std::size_t i = 0; i < giantCount; ++i) updateWake(i);
-    for (std::size_t i = 0; i < plankton.size(); ++i) {
-        plankton[i].seed = spread(systems[index].id*31U+unsigned(i)*83U);
-        plantPlankter(i,true);
-    }
-    buildRibbons();
-    nextTrailSlot = 0; trailCount = 0; trailTicks = 0;
-    recordTrails();
+    const unsigned index = number-unsigned(currents.size());
+    return {number,index,unsigned(spread(systems[index].id / 400U + 672U) % palettes.size())};
 }
-void Ocean::population() {
-    const unsigned seed = systems[index].id;
+void Ocean::population(unsigned seed) {
     for (unsigned i = 0; i < animals.size(); ++i) {
         const unsigned key = spread(seed * 887U + i*13U);
         const float angle = range(key+1)*tau;
@@ -334,12 +610,40 @@ void Ocean::population() {
         for (std::size_t i = 0; i < animals.size(); ++i) {
             auto& jelly = animals[i];
             const auto key = jelly.seed;
-            if (i < giantCount) {
+            if (const auto gate = bellPassageByAnimal[i]) {
+                const auto& passage = passages[gate-1];
+                jelly.home = passage.opening;
+                jelly.velocity = {};
+                jelly.size = passage.size;
+                jelly.kind = seaBell;
+                jelly.hue = passage.hue;
+                jelly.realm = gate-1;
+            } else if (i < giantCount) {
                 jelly.home = stations[i];
                 jelly.velocity = {.16f,0,.27f};
                 jelly.size = residentSize[i];
                 if (i == eclipseGiant) jelly.hue = .61f;
-                if (i == basinGiant) jelly.hue = .58f;
+            } else if (i > bellAnimals[1]) {
+                const auto boundary = std::upper_bound(bellAnimals.begin(),bellAnimals.end(),i);
+                const auto realm = unsigned(boundary-bellAnimals.begin()-1);
+                const auto slot = i-bellAnimals[realm];
+                const float angle = float(slot)*2.3999632f;
+                const float spread = (3.8f+6.2f*range(key+10))*swimmerScales[realm]*2.f;
+                const float z = std::lerp(passages[realm-1].opening.z,passages[realm].opening.z,
+                                          .14f+.70f*range(key+11));
+                jelly.realm = realm;
+                jelly.home = openingAt(z).centre+Vec{spread*std::cos(angle),.54f*spread*std::sin(angle),0.f};
+                jelly.cohort = 0;
+                jelly.kind = slot%3 == 0 ? lantern : petal;
+                jelly.hue = passages[realm-1].hue+.22f*(range(key+9)-.5f);
+                jelly.size = (.84f+1.45f*range(key+8))*swimmerScales[realm];
+                if (i >= viridianFirst && i < viridianEnd) {
+                    const auto group = (i-viridianFirst)%2;
+                    const float station = std::lerp(passages[2].opening.z,passages[3].opening.z,group ? .72f : .30f);
+                    const Vec offset{(group ? 5.8f : -5.8f)+2.9f*(range(key+10)-.5f),
+                                     2.1f*(range(key+11)-.5f),4.8f*(range(key+12)-.5f)};
+                    jelly.home = openingAt(station).centre+offset;
+                }
             } else if (i < giantCount+6) {
                 const float z = 105.f+float(i-giantCount)*11.f;
                 const auto reach = openingAt(z);
@@ -359,11 +663,11 @@ void Ocean::population() {
             }
             jelly.p = jelly.home;
         }
-        buildBanks();
     }
 }
 bool Ocean::beginCall() {
-    if (callStart >= 0.f || migrating() || paused) return false;
+    if (transforming() || returning()) return false;
+    if (callStart >= 0.f || paused) return false;
     callStart = clock;
     return true;
 }
@@ -381,7 +685,7 @@ std::size_t Ocean::nearestCrown() const {
     float distance = 44.f;
     for (std::size_t i = 0; i < animals.size(); ++i) {
         const auto& jelly = animals[i];
-        if (jelly.kind != crown) continue;
+        if (jelly.kind != crown || jelly.realm != depth) continue;
         const float reach = length(jelly.p-player);
         if (reach < distance) { best = i; distance = reach; }
     }
@@ -393,8 +697,12 @@ std::span<const Reply> Ocean::takeReplies() {
     replyCount = 0;
     return ready;
 }
+VoyageCue Ocean::takeVoyageCue() {
+    return std::exchange(voyageCue,VoyageCue{});
+}
 bool Ocean::pulse(Call type) {
-    if (clock-lastPulse < .83f || migrating() || paused) return false;
+    if (transforming() || returning()) return false;
+    if (clock-lastPulse < .83f || paused) return false;
     lastPulse = clock;
     lastCall = type;
     ++callNumber;
@@ -410,6 +718,7 @@ bool Ocean::pulse(Call type) {
     }
     for (auto& jelly : animals) {
         const float distance = length(jelly.p - player);
+        if (jelly.realm != depth || jelly.kind == seaBell) continue;
         if (!held && meeting == Encounter::Calling && jelly.kind == crown) continue;
         jelly.due = -1.f;
         jelly.relay = 0;
@@ -420,25 +729,34 @@ bool Ocean::pulse(Call type) {
     }
     return true;
 }
-void Ocean::voyage(unsigned destination) {
-    if (migrating() || destination == active || destination >= currents.size()+systems.size()) return;
-    target = destination;
-    transition = 0;
-    cancelCall();
+void Ocean::voyage(unsigned number) {
+    if (number >= currents.size()+systems.size() || (manualMorph && number == incoming.number)) return;
+    manualSource = atmosphere();
+    incoming = destination(number);
+    morphStart = clock;
+    morphEnd = clock+manualMorphSeconds;
+    manualMorph = true;
 }
 void Ocean::next() {
-    if (migrating()) return;
-    if (active < currents.size()-1) {
-        voyage(active+1);
-    } else {
-        uncharted();
-    }
+    const unsigned from = manualMorph ? incoming.number : current.number;
+    if (from < currents.size()-1) voyage(from+1);
+    else uncharted();
 }
-void Ocean::uncharted() {
-    if (migrating()) return;
+unsigned Ocean::unchartedDestination() {
     ++generation;
     const unsigned offset = (2999U + generation*3499U) % systems.size();
-    voyage(unsigned(currents.size())+offset);
+    return unsigned(currents.size())+offset;
+}
+void Ocean::uncharted() { voyage(unchartedDestination()); }
+
+void Ocean::startAutomaticMorph() {
+    const unsigned number = current.number < currents.size() ?
+                            (current.number+1)%unsigned(currents.size()) : unchartedDestination();
+    incoming = destination(number);
+    morphStart = clock;
+    const float variation = range(919U*++morphCount+systems[incoming.system].id);
+    morphEnd = clock+std::lerp(shortestMorphSeconds,longestMorphSeconds,variation);
+    manualMorph = false;
 }
 void Ocean::plantPlankter(std::size_t slot, bool arriving) {
     auto& mote = plankton[slot];
@@ -474,6 +792,7 @@ void Ocean::plantPlankter(std::size_t slot, bool arriving) {
     const auto water = waterAt(p);
     const float current = currentStrength(water);
     mote.p = p;
+    mote.drift = water.drift;
     mote.tail = p-water.drift*(.35f+.52f*current);
     mote.lifetime = foreground ? 12.f+14.f*range(seed+6) : 22.f+23.f*range(seed+6);
     mote.age = arriving ? 2.f+range(seed+7)*(mote.lifetime-5.f) : 0.f;
@@ -494,9 +813,11 @@ void Ocean::advancePlankton(float dt) {
             plantPlankter(i,false);
             continue;
         }
-        const auto water = waterAt(mote.p);
+        // Predict the midpoint from the previous sample. The tracer still advances on every physics tick.
+        const auto water = waterAt(mote.p+mote.drift*(dt*.5f));
         const float current = currentStrength(water);
-        mote.p += waterAt(mote.p+water.drift*(dt*.5f)).drift*dt;
+        mote.drift = water.drift;
+        mote.p += mote.drift*dt;
         const float trail = .04f+.52f*current;
         mote.tail += (mote.p-water.drift*trail-mote.tail)*smoothing;
         const float fade = ease(mote.age*.63f)*ease((mote.lifetime-mote.age-.22f)*.55f)*
@@ -509,7 +830,12 @@ void Ocean::buildRibbons() {
     const float streamLane = std::floor((player.x-streamAtLane(0,player.z,clock).x)/streamSpacing);
     const float eddyCell = std::floor((player.z-eddyOrigin)/eddySpacing);
     const float route = openingRoute() ? openingMask(player) : 0.f;
-    const auto visibleLines = openingRoute() ? flowLines+guideLines+sheetLines : flowLines;
+    const auto visibleLines = openingRoute() ? routeLines : flowLines;
+    std::array<Reach,flowNodes> guideSamples;
+    if (openingRoute()) {
+        for (std::size_t node = 0; node < flowNodes; ++node)
+            guideSamples[node] = openingAt(player.z-23.f+float(node)*2.55f);
+    }
     for (std::size_t line = 0; line < visibleLines; ++line) {
         const bool stream = line < streamLines;
         const bool eddy = !stream && line < streamLines+eddyLines;
@@ -522,23 +848,27 @@ void Ocean::buildRibbons() {
             const float band = float(line-flowLines)-3.f;
             const float layer = float(line-flowLines)-(float(guideLines)+1.f);
             for (std::size_t node = 0; node < flowNodes; ++node) {
-                const float z = player.z-23.f+float(node)*2.55f;
-                const auto reach = openingAt(z);
+                const auto& reach = guideSamples[node];
+                const float z = reach.centre.z;
                 const float width = std::lerp(1.42f,1.00f,reach.narrows);
                 const float extent = float(node)/float(flowNodes-1);
                 const float shape = ease(extent*5.f)*ease((1.f-extent)*5.f);
+                const float inlet = passages.back().opening.z;
+                const float destination = eased(z,inlet-51.f,inlet-14.f);
+                const float gathering = 1.f-.79f*eased(z,inlet-15.f,inlet+1.f);
                 const Vec offset = sheet ?
                     Vec{layer*.89f+1.12f*std::sin(z*.102f+layer*2.1f),layer*2.42f-1.22f,0.f} :
-                    Vec{width*band+.24f*std::sin(z*.15f+band),.58f*std::cos(band*1.67f+z*.044f),0.f};
+                    Vec{width*band+.24f*std::sin(z*.15f+band),.58f*std::cos(band*1.67f+z*.044f),0.f}*gathering;
                 const Vec path = reach.centre+offset;
-                const Vec swept = path+eclipseWash(path)*4.8f;
+                const Vec swept = path+eclipseWash(path)*4.8f+viridianWash(path)*1.35f;
                 const float light = route*reach.flow*shape;
                 if (sheet) {
                     const float span = std::lerp(7.9f,5.15f,reach.narrows)*(1.f+.09f*layer);
                     nodes[node] = {packed(swept,span),{z,5.f,layer,light}};
                 } else {
                     nodes[node] = {packed(swept,.75f+.73f*reach.flow),
-                                   {z+band*2.13f,4.f,.30f+1.90f*reach.flow,light*(1.f-.085f*std::abs(band))}};
+                                   {z+band*2.13f,4.f+destination,.30f+1.90f*reach.flow,
+                                    light*(1.f-.085f*std::abs(band))}};
                 }
             }
             continue;
@@ -597,26 +927,10 @@ void Ocean::buildRibbons() {
         }
     }
 }
-void Ocean::buildBanks() {
-    for (std::size_t line = 0; line < bankLines; ++line)
-        for (std::size_t node = 0; node < flowNodes; ++node) {
-            const float z = 46.f+float(node)*(140.f/float(flowNodes-1));
-            const auto reach = openingAt(z);
-            const float side = line%2 == 0 ? -1.f : 1.f;
-            const float layer = float(line/2);
-            const float bank = std::lerp(20.f,9.f,reach.narrows)+layer*7.f;
-            const float fold = (1.f+layer)*std::sin(z*.143f+side*2.1f);
-            const Vec p = reach.centre+Vec{side*(bank+fold),layer*4.f-1.6f,0.f};
-            flowView[(flowLines+guideLines+sheetLines+line)*flowNodes+node] = {
-                packed(p,13.f+layer*8.f+2.8f*std::sin(z*.091f)),
-                {z,3.f,side,reach.narrows*(1.f-layer*.44f)}
-            };
-        }
-}
 void Ocean::answerCalls() {
     for (std::size_t i = 0; i < animals.size(); ++i) {
         auto& jelly = animals[i];
-        if (jelly.due < 0 || clock < jelly.due) continue;
+        if (jelly.realm != depth || jelly.due < 0 || clock < jelly.due) continue;
         jelly.due = -1.f;
         jelly.answered = callNumber;
         jelly.response = clock;
@@ -635,7 +949,7 @@ void Ocean::answerCalls() {
         if (lastCall == Call::Draw) continue;
         if (jelly.kind != moon || jelly.relay >= 3) continue;
         for (auto& other : animals) {
-            if (other.kind == crown || other.answered == callNumber) continue;
+            if (other.realm != depth || other.kind == crown || other.kind == seaBell || other.answered == callNumber) continue;
             const float separation = length(other.p-jelly.p);
             const float reaches = clock+.17f+separation/pulseSpeed;
             if (separation < 9.6f && (other.due < 0 || reaches < other.due)) {
@@ -660,6 +974,10 @@ void Ocean::advanceShoal(float dt) {
     const float gathering = resident ? eased(player.z,156.f,213.f) : 0.f;
     for (std::size_t i = 0; i < animals.size(); ++i) {
         auto& jelly = animals[i];
+        if (const auto gate = bellPassageByAnimal[i]; resident && gate) {
+            jelly.phase = std::remainder(jelly.phase+(.17f+.13f*float(gate))*dt,tau);
+            continue;
+        }
         const auto& before = previous[i];
         const auto current = waterAt(before.p,true,i);
         Vec swimming{std::sin(jelly.hue*tau+clock*.33f)*.29f,
@@ -675,16 +993,12 @@ void Ocean::advanceShoal(float dt) {
                 const float traverse = eased(player.z,120.f,185.f);
                 home = jelly.home+Vec{54.f*traverse,.52f*std::sin(tide),1.05f*std::cos(tide*.58f)};
                 rate = .91f;
-            } else if (i == basinGiant) {
-                home = jelly.home+Vec{8.4f*std::sin(tide*.58f),2.6f*std::cos(tide*.47f),
-                                     4.2f*std::cos(tide*.52f)};
-                rate = .66f;
             }
             const bool crossing = i == eclipseGiant;
             const Vec patrol = limited((home-before.p)*(crossing ? .49f : .36f),crossing ? 2.6f : 1.8f)-current.drift;
             swimming = swimming*.38f+patrol;
         }
-        if (jelly.kind == crown) {
+        if (jelly.kind == crown || jelly.kind == seaBell) {
             if (!resident && i < giantCount) swimming += giantCourses[i]*.59f;
             if (i == crownGuest && (meeting == Encounter::Approaching || meeting == Encounter::Alongside)) {
                 const float curve = meeting == Encounter::Approaching ?
@@ -712,7 +1026,7 @@ void Ocean::advanceShoal(float dt) {
             unsigned joined = 0;
             for (std::size_t j = 0; j < previous.size(); ++j) {
                 const auto& other = previous[j];
-                if (i == j || other.kind == crown) continue;
+                if (i == j || other.kind == crown || other.kind == seaBell || other.realm != jelly.realm) continue;
                 const Vec offset = other.p-before.p;
                 const float d2 = dot(offset,offset);
                 if (d2 > 50.f) continue;
@@ -753,9 +1067,9 @@ void Ocean::advanceShoal(float dt) {
             swimming += unit(player-jelly.p)*(.30f*fresh);
         }
         jelly.phase = std::remainder(jelly.phase+rate*dt,tau);
-        swimming += pressure(before.p-player,1.3f+before.size*.58f)*1.35f;
+        if (jelly.kind != seaBell) swimming += pressure(before.p-player,1.3f+before.size*.58f)*1.35f;
         for (std::size_t j = 0; j < giantCount; ++j)
-            if (j != i) swimming += pressure(before.p-previous[j].p,
+            if (j != i && jelly.kind != seaBell && previous[j].kind != seaBell) swimming += pressure(before.p-previous[j].p,
                 (previous[j].size+before.size)*.51f)*.86f;
         const Vec relative = before.velocity-current.drift;
         const Vec error = limited(swimming,4.25f)-relative;
@@ -782,62 +1096,105 @@ void Ocean::advanceShoal(float dt) {
 }
 void Ocean::driftOpening(float dt, Vec& swim) {
     const auto reach = openingAt(player.z);
-    const auto ahead = openingAt(player.z+16.f);
-    Vec interest = ahead.centre-player;
+    const bool atWhirlpool = depth == whirlpoolDepth;
+    const Vec landmark = atWhirlpool ? whirlpoolCentre() : passages[depth].opening;
+    const bool missedOpening = !atWhirlpool && player.z >= landmark.z;
+    const auto ahead = openingAt(std::min(player.z+16.f,landmark.z+4.f));
+    Vec interest = (atWhirlpool ? landmark : ahead.centre)-player;
     if (crownGuest < animals.size() && meeting != Encounter::None) {
         const Vec towardsGuest = animals[crownGuest].p-player;
         interest += unit(towardsGuest)*6.f;
     }
-    lookYaw = approachAngle(lookYaw,std::atan2(interest.x,interest.z),1.f-std::exp(-dt*.64f));
+    const float bearing = atWhirlpool && eyeEntered >= 0.f ? yaw : std::atan2(interest.x,interest.z);
+    lookYaw = approachAngle(lookYaw,bearing,1.f-std::exp(-dt*.64f));
     lookPitch = std::lerp(lookPitch,std::clamp(interest.y*.036f,-.24f,.18f),
                           1.f-std::exp(-dt*.64f));
-    const float speed = std::lerp(1.38f,1.86f,reach.flow)*
-                        (1.f-.79f*eased(player.z,250.f,275.f));
+    const float speed = std::lerp(1.38f,1.86f,reach.flow);
     const Vec inward = reach.centre-player;
-    const Vec desired = reach.tangent*speed+limited(inward*.39f,1.15f);
+    Vec desired = reach.tangent*speed+limited(inward*.39f,1.15f);
+    if (atWhirlpool) desired = limited((landmark-player)*.85f,1.65f);
+    else if (missedOpening)
+        desired = limited((landmark-Vec{0,0,4.f}-player)*.68f,1.85f);
     const auto forward = facing(yaw,pitch);
     const auto right = unit(cross({0,1,0},forward));
-    const Vec correction = limited((desired-velocity)*.52f,.53f);
+    const Vec correction = limited((desired-velocity*(1.f/playerSpeedScale))*.52f,missedOpening ? .86f : .53f);
     swim = {dot(correction,right),correction.y,dot(correction,forward)};
     if (!demoCalled && player.z > 205.f && crownInRange() && pulse(Call::Draw)) demoCalled = true;
 }
-void Ocean::step(float dt, Vec swim, float panX, float panY) {
+void Ocean::crossBell(Vec previous, float dt) {
+    const auto withinOpening = [&](const BellPassage& gate) {
+        const float across = (gate.opening.z-previous.z)/(player.z-previous.z);
+        return apertureDistance(previous+(player-previous)*across,gate) < gate.aperture;
+    };
+    if (depth < passages.size()) {
+        const auto& ahead = passages[depth];
+        if (previous.z < ahead.opening.z && player.z >= ahead.opening.z && withinOpening(ahead)) ++depth;
+    }
+    if (depth > 0) {
+        const auto& behind = passages[depth-1];
+        if (previous.z >= behind.opening.z && player.z < behind.opening.z && withinOpening(behind)) --depth;
+    }
+    depthBlend = std::lerp(depthBlend,float(depth),1.f-std::exp(-dt*1.35f));
+    if (std::abs(depthBlend-float(depth)) < .001f) depthBlend = float(depth);
+    skyDepthBlend = std::lerp(skyDepthBlend,float(depth),1.f-std::exp(-dt*.58f));
+    if (std::abs(skyDepthBlend-float(depth)) < .001f) skyDepthBlend = float(depth);
+}
+void Ocean::step(float dt, Vec swim, float panX, float panY, bool brake) {
     if (paused) return;
-    lookYaw = std::remainder(lookYaw+panX,tau);
-    lookPitch = std::clamp(lookPitch+panY,-1.26f,1.26f);
+    if (!transforming()) {
+        const float steering = returnSteering(returnFlight);
+        if (steering > .12f && demo && (brake || dot(swim,swim) > .04f)) demo = false;
+        lookYaw = std::remainder(lookYaw+panX*steering,tau);
+        lookPitch = std::clamp(lookPitch+panY*steering,-1.26f,1.26f);
+    }
     physicsRemainder += std::clamp(double(dt),0.,.12);
     while (physicsRemainder >= physicsStep) {
         physicsRemainder -= physicsStep;
-        integrate(float(physicsStep),swim);
+        integrate(float(physicsStep),swim,brake);
     }
+}
+
+const std::array<FlowNode,routeLines*flowNodes>& Ocean::ribbons() {
+    // Generate display geometry only when a frame uses it.
     if (clock >= nextFlow) {
         buildRibbons();
         nextFlow = clock+1.f/36.f;
     }
+    return flowView;
 }
-void Ocean::integrate(float dt, Vec swim) {
+void Ocean::integrate(float dt, Vec swim, bool brake) {
     clock += dt;
+    if (transforming()) {
+        if (clock-transformationStart >= transformationSeconds) restartCycle();
+        return;
+    }
+    const float previousFlight = returnFlight;
+    returnFlight = std::max(0.f,returnFlight-dt/returnSeconds);
+    constexpr float returnChime = 5.2f;
+    if (previousFlight > 0.f && returnElapsed(previousFlight) < returnChime &&
+        returnElapsed(returnFlight) >= returnChime)
+        voyageCue = {VoyageSound::SystemReturn,systems[bellCatalogues[0]].id};
+    if (openingRoute()) updateOpeningStroke();
+    const float steering = returnSteering(returnFlight);
     note *= std::exp(-4.8f*dt);
     accent *= std::exp(-.27f*dt);
-    if (migrating()) {
-        const float before = transition;
-        transition += dt*.38f;
-        if (before < .5f && transition >= .5f) arrive(target);
-        if (transition >= 1.f) transition = -1.f;
+    if (clock >= morphEnd) {
+        current = incoming;
+        visited[current.system] = true;
+        startAutomaticMorph();
     }
-    if (demo && openingRoute() && !migrating()) {
-        driftOpening(dt,swim);
-    } else if (demo && !migrating()) {
+    if (demo && openingRoute()) {
+        driftOpening(dt*steering,swim);
+    } else if (demo) {
         lookYaw = std::remainder(lookYaw+dt*.047f*std::sin(clock*.17f),tau);
         lookPitch = std::clamp(lookPitch+dt*.009f*std::cos(clock*.13f),-1.26f,1.26f);
         swim = {.20f*std::cos(clock*.29f),.15f*std::sin(clock*.18f),.62f};
         if (clock > demoSoon && callStart < 0.f) {
             pulse();
             demoSoon = clock + 9.f;
-            if (int(clock) % 40 < 9) next();
         }
     }
-    const float lookBlend = 1.f-std::exp(-dt*24.f);
+    const float lookBlend = 1.f-std::exp(-dt*(demo ? 24.f : 46.f));
     yaw = approachAngle(yaw,lookYaw,lookBlend);
     pitch = std::lerp(pitch,lookPitch,lookBlend);
     const Vec forward = facing(yaw,pitch);
@@ -846,25 +1203,90 @@ void Ocean::integrate(float dt, Vec swim) {
     const float swimPulse = .87f+.25f*std::sin(clock*2.35f);
     const auto water = waterAt(player);
     const Vec medium = water.drift;
-    const Vec slip = velocity-medium;
-    const Vec thrust = limited(movement,1.f)*(6.25f*swimPulse);
+    // Keep the drag and steering response while scaling player travel through the world.
+    const Vec slip = velocity*(1.f/playerSpeedScale)-medium;
     const float entry = openingRoute() ? .52f*ease(water.stream) : 0.f;
-    const Vec drag = slip*(.76f+.27f*length(slip)+entry);
+    const float slipSpeed = length(slip);
+    const Vec input = limited(movement,1.f);
+    const float effort = !demo && !brake ? length(input) : 0.f;
+    strokeEffort = std::lerp(strokeEffort,effort,1.f-std::exp(-dt*(effort>strokeEffort ? 12.f : 6.f)));
+    swimPhase = std::remainder(swimPhase+dt*(2.34f+2.21f*strokeEffort),tau);
+
+    Vec acceleration;
+    if (demo) {
+        acceleration = input*(6.25f*swimPulse)-slip*(.76f+.27f*slipSpeed+entry);
+    } else if (brake) {
+        acceleration = slip*(-4.8f-.32f*slipSpeed);
+    } else {
+        // Steer the motion through the water while keeping the current's own velocity.
+        const Vec axis = input*(1.f/std::max(.001f,effort));
+        const float along = dot(slip,axis);
+        const Vec lateral = slip-axis*along;
+        const Vec reversing = axis*std::min(0.f,along);
+        const float drag = std::lerp(.53f+.13f*slipSpeed,.87f+.22f*slipSpeed,effort)+.38f*entry;
+        const float stroke = .92f+.15f*std::sin(swimPhase);
+        acceleration = input*(10.4f*stroke)-slip*drag-(lateral*3.1f+reversing*2.4f)*effort;
+    }
+    if (depth == whirlpoolDepth && !demo && effort < .1f) {
+        const Vec offset = whirlpoolCentre()-player;
+        if (dot(offset,offset) <= whirlpoolEye*whirlpoolEye)
+            acceleration += offset*3.f-velocity*6.f;
+    }
     Vec separation{};
     for (const auto& animal : animals)
-        separation += pressure(player-animal.p,1.27f+animal.size*.55f)*1.28f;
-    velocity += (thrust-drag+limited(separation,2.4f))*dt;
-    player += velocity*dt;
+        if (animal.realm == depth && animal.kind != seaBell)
+            separation += pressure(player-animal.p,1.27f+animal.size*.55f)*1.28f;
+    velocity += (acceleration+limited(separation,2.4f))*(dt*playerSpeedScale*steering);
+    const Vec previous = player;
+    player += velocity*(dt*steering);
+    if (openingRoute()) crossBell(previous,dt);
+    if (depth == whirlpoolDepth && playerSystemBirth < 0.f) {
+        const Vec centre = whirlpoolCentre();
+        const Vec travel = player-previous;
+        const float along = std::clamp(dot(centre-previous,travel)/std::max(.000001f,dot(travel,travel)),0.f,1.f);
+        const Vec nearest = previous+travel*along-centre;
+        if (dot(nearest,nearest) <= whirlpoolEye*whirlpoolEye) {
+            playerSystemBirth = clock;
+            voyageCue = {VoyageSound::SystemBirth,systems[bellCatalogues[bellSystemSlots.back()]].id};
+        }
+    }
+    const Vec eyeOffset = player-whirlpoolCentre();
+    if (depth == whirlpoolDepth && dot(eyeOffset,eyeOffset) <= whirlpoolEye*whirlpoolEye) {
+        if (eyeEntered < 0.f) eyeEntered = clock;
+        if (clock-eyeEntered >= eyeHoldSeconds) {
+            transformationStart = clock;
+            cancelCall();
+        }
+    } else {
+        eyeEntered = -1.f;
+    }
     for (std::size_t i = 0; i < giantCount; ++i) updateWake(i);
-    eye += (player-eye)*(1.f-std::exp(-dt*5.2f));
+    eye += (player-eye)*(1.f-std::exp(-dt*(demo ? 5.2f : 8.2f)));
+    const Vec controlVelocity = velocity*(1.f/playerSpeedScale);
     const Vec trailWater = waterAt(player-Vec{0,playerSize*1.35f,0}).drift;
-    tailSlip += (limited(trailWater-velocity+medium*(entry*.46f),4.f)-tailSlip)*
+    tailSlip += (limited(trailWater-controlVelocity+medium*(entry*.46f),4.f)-tailSlip)*
                 (1.f-std::exp(-dt*2.0f));
-    const Vec heading = movement+medium*entry;
-    if (heading.x*heading.x+heading.z*heading.z > .05f)
-        bodyYaw = approachAngle(bodyYaw,std::atan2(heading.x,heading.z),
-                                1.f-std::exp(-dt*2.2f));
+    const Vec heading = demo ? movement+medium*entry :
+                        effort>.05f ? input+controlVelocity*.12f : controlVelocity*.45f;
+    float bank = 0.f;
+    if (heading.x*heading.x+heading.z*heading.z > .05f) {
+        const float target = std::atan2(heading.x,heading.z);
+        bank = .49f*effort*std::sin(target-bodyYaw);
+        bodyYaw = approachAngle(bodyYaw,target,1.f-std::exp(-dt*(demo ? 2.2f : 2.5f+3.7f*effort)));
+    }
+    bodyBank = std::lerp(bodyBank,bank,1.f-std::exp(-dt*8.2f));
+    const Vec bodyForward = facing(bodyYaw,0.f);
+    const Vec waterRelative = controlVelocity-medium;
+    const float glide = eased(dot(controlVelocity,bodyForward),.22f,3.f);
+    const float stroke = eased(dot(waterRelative,bodyForward),.28f,4.75f);
+    const float intent = effort > 0.f ? std::max(0.f,dot(input,bodyForward)) : 0.f;
+    const float dive = eased(-waterRelative.y,.26f,4.2f);
+    const float climb = eased(waterRelative.y,.26f,4.2f);
+    const float lean = std::clamp(.49f*glide+.23f*stroke+.23f*intent+.35f*dive-.23f*climb,0.f,1.05f);
+    bodyPitch = std::lerp(bodyPitch,lean,1.f-std::exp(-dt*(lean>bodyPitch ? 7.2f : 4.8f)));
     advanceShoal(dt);
+    if (openingRoute() && player.z > passages[2].opening.z-95.f &&
+        player.z < passages[3].opening.z+95.f) updateViridianShoals();
     advancePlankton(dt);
     if (++trailTicks == ticksPerTrailSample) {
         recordTrails();
@@ -872,56 +1294,41 @@ void Ocean::integrate(float dt, Vec swim) {
     }
 }
 std::string Ocean::title() const {
-    return active < currents.size() ? currents[active].title : "Drift " + std::to_string(systems[index].id);
+    return current.number < currents.size() ? currents[current.number].title :
+           "Drift " + std::to_string(systems[current.system].id);
 }
-const char* Ocean::waterName() const { return waterNames[palette]; }
+const char* Ocean::waterName() const { return waterNames[current.palette]; }
 const char* Ocean::habitatName() const {
+    if (depth > 0) return innerNames[depth-1];
     if (!openingRoute() || openingMask(player) < .25f) return waterName();
     if (player.z >= 174.f) return "Lantern Basin";
     if (player.z >= 62.f) return "The Narrows";
     return "Open Water";
+}
+unsigned Ocean::look() const {
+    const auto stage = unsigned(std::round(depthBlend));
+    return stage > 0 ? bellScorePalettes[stage-1] : current.palette;
 }
 float Ocean::basinAmount() const {
     return openingRoute() ? openingAt(player.z).basin*openingMask(player) : 0.f;
 }
 unsigned Ocean::visitedCount() const { return unsigned(std::count(visited.begin(),visited.end(),1)); }
 
-Scene Ocean::scene(float aspect) const {
-    const auto& p = palettes[palette];
-    const auto& system = systems[index];
-    const Vec forward = facing(yaw,pitch);
-    const Vec right = unit(cross({0,1,0},forward));
-    const Vec up = cross(forward,right);
+Ocean::Atmosphere Ocean::atmosphereAt(Destination location) const {
+    const auto& p = palettes[location.palette];
+    const auto& system = systems[location.system];
     const float seed = range(system.id + 19);
-    const Vec camera = eye - forward*10.2f - up*2.12f;
     const float warm = logRange(system.temperature,2800,8500);
-    Scene result{};
-    result.screen = {aspect,clock,clock-lastPulse,migrating() ? std::sin(pi*transition) : 0};
-    result.eye = packed(camera); result.forward = packed(forward);
-    result.right = packed(right); result.up = packed(up);
+    Atmosphere result{};
     result.deep = p.deep; result.water = p.water; result.bright = p.bright; result.contrast = p.contrast;
-    result.habitat.w = currentStrength(waterAt(player));
-    if (openingRoute()) {
-        const auto reach = openingAt(player.z);
-        const float mask = openingMask(player);
-        const float narrow = reach.narrows*mask, basin = reach.basin*mask;
-        result.habitat = {1.f,narrow,basin,result.habitat.w};
-        result.deep = {.0015f+.0071f*narrow,.004f+.007f*basin-.003f*narrow,.026f-.015f*narrow+.017f*basin};
-        result.water = {.004f+.021f*basin,.32f-.224f*narrow+.11f*basin,
-                        .51f-.18f*narrow+.12f*basin};
-        result.bright = {.014f+.054f*basin,1.f-.14f*narrow,.77f+.19f*narrow+.16f*basin};
-        result.contrast = {.27f+.19f*narrow+.12f*basin,.012f+.063f*basin,1.f};
-        const auto& occluder = animals[eclipseGiant];
-        const float bell = occluder.size*(1.08f+.073f*std::sin(occluder.phase));
-        const float visible = std::sqrt(mask*shoalFade(occluder.p-player));
-        result.eclipse = packed(occluder.p+Vec{0,.43f*occluder.size,0},bell*visible);
-    }
+    result.paletteMix = {float(location.palette == 0),float(location.palette == 1),
+                         float(location.palette == 2),float(location.palette == 3)};
+    result.seed = seed;
+    result.noctiluca = location.number == 0 ? 1.f : 0.f;
     const Vec star = unit({-.48f+.08f*seed,.28f+.14f*seed,.94f});
     result.sun = packed(star,.052f+.045f*logRange(system.radius,7.25f,9.85f));
     result.sunlight = {1.f-.26f*warm,.49f+.40f*warm,.32f+.68f*warm,1.f};
-    result.tide = {seed,accent,float(palette),std::sin(clock*.069f)*.5f+.5f};
-    result.player = packed(pulseOrigin);
-    result.call = {callCharge(),drawnCall() ? 1.f : 0.f,drawnCall() ? drawSpeed : pulseSpeed,0.f};
+    const float orbitTime = float(orbitalEpoch+double(clock));
     unsigned mainBody = 0;
     for (unsigned i = 1; i < system.count; ++i) {
         const auto& current = system.orbits[i];
@@ -933,10 +1340,10 @@ Scene Ocean::scene(float aspect) const {
         const auto& body = system.orbits[i];
         const unsigned slot = i == mainBody ? 0 : (i < mainBody ? i+1 : i);
         const float phase = range(system.id+47*slot)*tau;
-        const float drift = std::sin(clock * (.018f-.012f*logRange(body.period,6,10)) + phase);
+        const float drift = std::sin(orbitTime*(.018f-.012f*logRange(body.period,6,10))+phase);
         const float y = slot == 0 ? .226f : (slot == 1 ? -.28f : .39f);
         const float x = slot == 0 ? .50f : (slot == 1 ? -.82f : .94f);
-        const Vec direction = unit({x + .045f*drift,y+.038f*std::cos(phase+clock*.009f),1.f});
+        const Vec direction = unit({x+.045f*drift,y+.038f*std::cos(phase+orbitTime*.009f),1.f});
         const float size = (slot == 0 ? .129f : .030f) +
             (slot == 0 ? .098f : .048f)*logRange(body.radius,5.5f,8);
         result.planets[slot].position = packed(direction,size);
@@ -945,40 +1352,344 @@ Scene Ocean::scene(float aspect) const {
         const float giant = logRange(body.radius,7.1f,7.6f);
         result.planets[slot].material = {giant,body.clouds+.26f*temperature,
                                          .24f + .40f*std::sin(phase+tilt),
-                                         std::min(body.rings,2.4f)};
+                                         std::clamp(body.rings,0.f,2.4f)};
+        result.planets[slot].ringOpacity = eased(body.rings,0.f,.18f);
+        result.planets[slot].opacity = 1.f;
         const Vec tint = hue(.45f+seed*.24f + .33f*temperature + .08f*body.material);
-        result.planets[slot].pigment = packed(tint,.16f*clock/(.45f+logRange(body.distance,10,13))+phase);
+        result.planets[slot].pigment = packed(tint,.16f*orbitTime/(.45f+logRange(body.distance,10,13))+phase);
+    }
+    return result;
+}
+Ocean::Atmosphere Ocean::atmosphere() const {
+    const float t = eased(clock,morphStart,morphEnd);
+    const auto from = manualMorph ? manualSource : atmosphereAt(current);
+    if (t <= 0.f) return from;
+    const auto to = atmosphereAt(incoming);
+    if (t >= 1.f) return to;
+    Atmosphere result{};
+    result.deep = blend(from.deep,to.deep,t);
+    result.water = blend(from.water,to.water,t);
+    result.bright = blend(from.bright,to.bright,t);
+    result.contrast = blend(from.contrast,to.contrast,t);
+    result.sun = blendDirection(from.sun,to.sun,t);
+    result.sunlight = blend(from.sunlight,to.sunlight,t);
+    result.paletteMix = blend(from.paletteMix,to.paletteMix,t);
+    result.seed = std::lerp(from.seed,to.seed,t);
+    result.noctiluca = std::lerp(from.noctiluca,to.noctiluca,t);
+    for (std::size_t i = 0; i < result.planets.size(); ++i) {
+        auto a = from.planets[i];
+        auto b = to.planets[i];
+        if (a.position.w == 0.f && b.position.w == 0.f) continue;
+        if (a.position.w == 0.f) {
+            a = b;
+            a.opacity = 0.f;
+            a.ringOpacity = 0.f;
+        } else if (b.position.w == 0.f) {
+            b = a;
+            b.opacity = 0.f;
+            b.ringOpacity = 0.f;
+        }
+        result.planets[i] = {blendDirection(a.position,b.position,t),blend(a.material,b.material,t),
+                             blend(a.pigment,b.pigment,t),std::lerp(a.ringOpacity,b.ringOpacity,t),
+                             std::lerp(a.opacity,b.opacity,t)};
+    }
+    return result;
+}
+void Ocean::writeBellSystems(std::span<BellSystem,bellSystemCount> output, std::uint64_t visible) const {
+    static_assert(bellSystemCount <= 64);
+    constexpr std::array<float,bellCatalogueIds.size()> orientations{.06f,-.18f,.08f,-.31f,.24f,-.31f};
+    for (std::size_t slot = 0; slot < output.size(); ++slot) {
+        if ((visible & (std::uint64_t{1} << slot)) == 0) continue;
+        const auto swimmer = bellSystemSlots.back();
+        const auto source = slot == 0 && transforming() ? swimmer : slot;
+        const bool newSky = slot == 0 && (transforming() || inheritedSky);
+        const auto catalogue = bellCatalogues[source];
+        const auto system = atmosphereAt({1u,catalogue,unsigned(slot%palettes.size())});
+        const float bearing = slot < orientations.size() ? orientations[slot] : 1.22f*(range(unsigned(slot)*137u)-.5f);
+        const float sn = std::sin(bearing), cs = std::cos(bearing);
+        const auto orient = [&](Quad direction) {
+            if (slot == 0) direction.x = -direction.x;
+            return Quad{cs*direction.x+sn*direction.z,direction.y,cs*direction.z-sn*direction.x,direction.w};
+        };
+        auto& local = output[slot];
+        local = {orient(system.sun),system.sunlight,system.planets,{}};
+        local.sunlight.w = (float(slot)+system.seed)/float(bellSystemCount);
+        if (source == swimmer || newSky) {
+            local.sunlight.w = system.seed;
+            auto& planet = local.planets.front();
+            const unsigned signature = spread(systems[catalogue].id+1471u);
+            const float side = (signature&1u) ? 1.f : -1.f;
+            planet.material.z = side*(.50f+.21f*range(signature+1u));
+            planet.material.w = 1.72f+.24f*range(signature+7u);
+            planet.ringOpacity = 1.f;
+            const Vec tint = (signature&2u) ? Vec{.84f,.34f,.62f} : Vec{.26f,.78f,.93f};
+            planet.pigment = blend(planet.pigment,packed(tint,planet.pigment.w),.56f);
+        }
+        for (std::size_t i = 0; i < local.planets.size(); ++i) {
+            auto& planet = local.planets[i];
+            planet.position = orient(planet.position);
+            if (planet.position.w <= 0.f) continue;
+            const auto direction = planet.position;
+            if (i == 0) {
+                // The inherited ring clears the moon and the returning swimmer.
+                local.skyPositions[i] = newSky ? packed(unit({.69f,-.08f,1.f}),direction.w) : direction;
+                continue;
+            }
+            // Place the companion planets to either side and behind the swimmer. The
+            // orbit belongs to the bell's world and never depends on the camera heading.
+            const float azimuth = (i == 1 ? -1.66f : 2.61f)+.25f*(system.seed-.5f)+.28f*direction.x;
+            const float radius = std::sqrt(std::max(0.f,1.f-direction.y*direction.y));
+            local.skyPositions[i] = {radius*std::sin(azimuth), direction.y, radius*std::cos(azimuth), direction.w};
+        }
+    }
+}
+
+Scene Ocean::scene(float aspect, bool exteriorView) const {
+    exteriorView = exteriorView && !transforming() && !returning();
+    const auto sky = atmosphere();
+    const Vec forward = facing(yaw,pitch);
+    const Vec right = unit(cross({0,1,0},forward));
+    const Vec up = cross(forward,right);
+    const float scale = descentScale(depthBlend);
+    const Vec camera = eye-(forward*10.2f+up*2.12f)*scale;
+    // Present the orbit continuously between the fixed physics ticks.
+    const float visibleTime = exteriorView ? clock+float(physicsRemainder) : clock;
+    Scene result{};
+    result.screen = {aspect,visibleTime,clock-lastPulse,sky.noctiluca};
+    result.celestialTime = float(orbitalEpoch+double(visibleTime));
+    result.eye = packed(camera); result.forward = packed(forward);
+    result.right = packed(right); result.up = packed(up);
+    result.deep = sky.deep; result.water = sky.water; result.bright = sky.bright; result.contrast = sky.contrast;
+    result.sun = sky.sun; result.sunlight = sky.sunlight; result.planets = sky.planets;
+    result.paletteMix = sky.paletteMix;
+    const float paletteTone = sky.paletteMix.y+2.f*sky.paletteMix.z+3.f*sky.paletteMix.w;
+    result.tide = {sky.seed,accent,paletteTone,std::sin(result.celestialTime*.069f)*.5f+.5f};
+    result.player = packed(returning() ? player : pulseOrigin);
+    result.call = {callCharge(),drawnCall() ? 1.f : 0.f,drawnCall() ? drawSpeed : pulseSpeed,0.f};
+    result.habitat.w = currentStrength(waterAt(player));
+    result.cycle.w = returnFlight;
+    if (openingRoute()) {
+        const float progress = transformationProgress();
+        const float docking = eased(progress,.86f,.982f);
+        const Vec lightingPosition = player+(basinSpawn()-player)*docking;
+        const auto reach = openingAt(lightingPosition.z);
+        const float mask = openingMask(lightingPosition);
+        const float narrow = reach.narrows*mask, basin = reach.basin*mask;
+        result.habitat = {1.f,narrow,basin,result.habitat.w};
+        if (!exteriorView && !transforming())
+            result.basinWave = packed(unpack(openingWave),openingWave.w*(1.f-ease(depthBlend)));
+        const float enclosingColour = mask*(.83f+.09f*basin);
+        result.deep = blend(result.deep,enclosingPalette.deep,enclosingColour);
+        result.water = blend(result.water,enclosingPalette.water,enclosingColour);
+        result.bright = blend(result.bright,enclosingPalette.bright,enclosingColour);
+        result.contrast = blend(result.contrast,enclosingPalette.contrast,enclosingColour);
+        const auto& occluder = animals[eclipseGiant];
+        const float bell = occluder.size*(1.08f+.073f*std::sin(occluder.phase));
+        const float visible = std::sqrt(mask*shoalFade(occluder.p-lightingPosition));
+        result.eclipse = packed(occluder.p+Vec{0,.43f*occluder.size,0},bell*visible);
+        const Quad basinDeep = result.deep, basinWater = result.water,
+                   basinBright = result.bright, basinContrast = result.contrast;
+        const float inside = ease(depthBlend);
+        const float innerStage = std::max(0.f,depthBlend-1.f);
+        const auto stage = std::min(unsigned(innerStage),unsigned(bellPassageCount-2));
+        const float phase = ease(innerStage-float(stage));
+        const auto& from = innerPalettes[stage];
+        const auto& to = innerPalettes[stage+1];
+        result.deep = blend(result.deep,blend(from.deep,to.deep,phase),inside);
+        result.water = blend(result.water,blend(from.water,to.water,phase),inside);
+        result.bright = blend(result.bright,blend(from.bright,to.bright,phase),inside);
+        result.contrast = blend(result.contrast,blend(from.contrast,to.contrast,phase),inside);
+        constexpr std::array<Quad,bellPassageCount> playerColours{{
+            {.89f,0.f,0.f,.11f}, {.08f,.07f,.85f,0.f}, {.43f,.57f,0.f,0.f},
+            {0.f,0.f,0.f,1.f}, {.30f,.70f,0.f,0.f}
+        }};
+        result.paletteMix = blend(result.paletteMix,blend(playerColours[stage],playerColours[stage+1],phase),inside);
+        float membrane = 0.f;
+        for (std::size_t i = 0; i < passages.size(); ++i) {
+            const auto& passage = passages[i];
+            result.passages[i] = packed(passage.opening,passage.aperture);
+            result.passageColours[i] = innerPalettes[i].bright;
+            membrane = std::max(membrane,(1.f-eased(std::abs(player.z-passage.opening.z),.2f,9.f))*
+                (1.f-eased(apertureDistance(player,passage),passage.aperture*.46f,passage.aperture)));
+        }
+        result.innerOcean = {depthBlend,membrane,0.f,systemEmergence()};
+        if (result.innerOcean.w > 0.f) result.playerSystem = float(bellSystemSlots.back()+1);
+        result.skyDepth = exteriorView ? 0.f : skyDepthBlend;
+        if (depthBlend > 1.62f && !exteriorView) {
+            const Vec centre = whirlpoolCentre();
+            result.whirlpool = packed(centre,whirlpoolEye);
+            result.whirlpoolApproach = 1.f-eased(length(player-centre),3.4f,58.f);
+        }
+        result.enclosingBell = packed(enclosingBellCentre,enclosingBellSize);
+        result.enclosedOrbits = packed((basinSpawn()-enclosingBellCentre)*(1.f/enclosingBellSize),.34f);
+        if (exteriorView) {
+            const float orbit = -.19f+.13f*std::sin(visibleTime*.081f);
+            const Vec offset{4.42f*std::sin(orbit),.28f, -4.42f*std::cos(orbit)};
+            const Vec outside = enclosingBellCentre+offset*enclosingBellSize;
+            const Vec aim = unit(Vec{0.f,-.71f,0.f}-offset);
+            const Vec across = unit(cross({0.f,1.f,0.f},aim));
+            result.eye = packed(outside);
+            result.forward = packed(aim);
+            result.right = packed(across);
+            result.up = packed(cross(aim,across));
+            result.deep = sky.deep;
+            result.water = sky.water;
+            result.bright = sky.bright;
+            result.contrast = sky.contrast;
+            result.paletteMix = sky.paletteMix;
+            result.habitat = result.eclipse = result.innerOcean = {};
+            result.innerOcean.z = 1.f;
+            result.screen.z = 6.f;
+        }
+        const float breath = std::sin(result.celestialTime*.266f+.51f);
+        const float width = 1.f+.026f*breath, dome = .69f-.042f*breath, bowl = .34f+.022f*breath;
+        result.enclosingShape = {width,dome,bowl,1.f};
+        if (eyeEntered >= 0.f) result.cycle.x = ease((clock-eyeEntered)/eyeHoldSeconds);
+        if (transforming()) {
+            const float outsideBlend = eased(progress,.085f,.52f);
+            const float pullback = eased(progress,.035f,.57f);
+            const float sweep = eased(progress,.15f,.91f);
+            const float approach = eased(progress,.775f,.937f);
+            const float radius = transformationRadius(progress,scale);
+            const Vec centre = player+(enclosingBellCentre-player)*eased(progress,.54f,.71f);
+            const float orbitYaw = std::lerp(yaw,0.f,pullback)+std::lerp(.26f,-.54f,sweep);
+            const Vec orbit = centre+Vec{-4.15f*std::sin(orbitYaw),.24f+.62f*sweep,
+                                         -4.15f*std::cos(orbitYaw)}*radius;
+            const Vec near = eye+(camera-eye)*(radius/(playerSize*scale));
+            const Vec inlet = returnInlet();
+            const Vec axis = returnAxis();
+            const Vec threshold = inlet+axis*(.015f*enclosingBellSize);
+            const Vec arrival = basinCamera();
+            const float seconds = (progress-1.f)*transformationSeconds;
+            const Vec approachEye = arrival+(threshold-arrival)*passageDistance(seconds);
+            const Vec pulledEye = near+(orbit-near)*pullback;
+            const Vec movingEye = pulledEye+(approachEye-pulledEye)*approach;
+            const Vec target = centre-Vec{0,.67f*radius,0};
+            const Vec orbitAim = unit(forward*(1.f-pullback)+unit(target-pulledEye)*pullback);
+            const Vec aim = unit(orbitAim*(1.f-approach)+axis*approach);
+            const Vec across = unit(cross({0,1,0},aim));
+            result.eye = packed(movingEye);
+            result.forward = packed(aim);
+            result.right = packed(across);
+            result.up = packed(cross(aim,across));
+            result.enclosingBell = packed(centre,radius);
+            result.enclosingShape.w = eased(progress,.24f,.52f);
+            const float stroke = (progress-.395f)/.077f;
+            if (stroke > 0.f && stroke < 3.f) {
+                const float phase = stroke-std::floor(stroke);
+                const float squeeze = eased(phase,0.f,.39f)*(1.f-eased(phase,.49f,1.f));
+                result.enclosingShape.x *= 1.f-.115f*squeeze;
+                result.enclosingShape.y *= 1.f+.18f*squeeze;
+                result.enclosingShape.z *= 1.f+.08f*squeeze;
+            }
+            result.cycle = {1.f,progress,outsideBlend,0.f};
+            result.returnPassage = packed(inlet,eased(progress,.744f,.865f));
+            result.passageFlow = packed(axis,seconds);
+            result.deep = blend(result.deep,blend(sky.deep,basinDeep,docking),outsideBlend);
+            result.water = blend(result.water,blend(sky.water,basinWater,docking),outsideBlend);
+            result.bright = blend(result.bright,blend(sky.bright,basinBright,docking),outsideBlend);
+            result.contrast = blend(result.contrast,blend(sky.contrast,basinContrast,docking),outsideBlend);
+            result.paletteMix = blend(result.paletteMix,blend({0.f,1.f,0.f,0.f},sky.paletteMix,docking),outsideBlend);
+        } else if (returnFlight > 0.f && !exteriorView) {
+            const Vec inlet = returnInlet(), axis = returnAxis();
+            const Vec threshold = inlet+axis*(.015f*enclosingBellSize);
+            const float elapsed = returnElapsed(returnFlight);
+            const float release = eased(elapsed,4.2f,returnTravelSeconds);
+            const Vec aim = unit(axis+(forward-axis)*release);
+            const Vec across = unit(cross({0,1,0},aim));
+            const Vec offset = (threshold-camera)*passageDistance(elapsed);
+            result.eye = packed(camera+offset);
+            result.forward = packed(aim);
+            result.right = packed(across);
+            result.up = packed(cross(aim,across));
+            result.basinArrival = 1.f-eased(length(offset),11.f,150.f);
+            result.returnPassage = packed(inlet,1.f);
+            result.passageFlow = packed(axis,elapsed);
+        }
+        const auto& shape = result.enclosingShape;
+        const Vec observer = (unpack(result.eye)-unpack(result.enclosingBell))*(1.f/result.enclosingBell.w);
+        const float height = observer.y >= 0.f ? shape.y : shape.z;
+        const float shell = length({observer.x/shape.x,observer.y/height,observer.z/shape.x});
+        result.enclosingSky = 1.f-eased(shell,.966f,1.028f);
     }
     return result;
 }
 Jelly Ocean::animalView(const Animal& jelly) const {
     const float glow = std::exp(-std::max(0.f,clock-jelly.response)*.72f);
+    const auto index = std::size_t(&jelly-animals.data());
     Jelly view{packed(jelly.p,jelly.size),
                {jelly.hue,jelly.phase,glow,float(jelly.kind)},
                {std::sin(jelly.phase)*.10f,jelly.heading,0.f,range(jelly.seed+19)},
                packed(jelly.slip,jelly.synchrony),shoalFade(jelly.p-player)};
+    view.bellSystem = float(bellSystemSlots[index]+1);
+    if (jelly.kind == petal || jelly.kind == lantern)
+        view.pitch = (jelly.kind == petal ? .39f : .09f)+.23f*std::sin(jelly.phase+jelly.hue*tau);
     if (openingRoute()) {
         view.eclipsing = &jelly == &animals[eclipseGiant] ? 1.f : 0.f;
-        if (&jelly == &animals[basinGiant]) {
+        const auto gateIndex = bellPassageByAnimal[index];
+        if (gateIndex) {
             const float distance = length(jelly.p-player);
-            const float entering = eased(player.z,154.f,202.f);
-            view.presence = std::max(view.presence,entering*(1.f-eased(distance,168.f,226.f)));
+            const float reach = std::max(1.f,jelly.size/40.f);
+            const float entering = gateIndex == 1 ? eased(player.z,96.f,202.f) : 1.f;
+            view.presence = entering*(1.f-eased(distance,136.f*reach,221.f*reach));
+            view.membraneAnchor = float(gateIndex);
+            view.flow.x = view.flow.y = 0.f;
+            if (gateIndex == 1 && openingStroke >= 0.f) {
+                const float stroke = openingContraction(clock-openingStroke);
+                view.trail.w = stroke;
+                view.pigment.z = std::max(view.pigment.z,.56f*stroke);
+            }
         }
-        if (jelly.cohort) {
+        if (jelly.cohort && jelly.realm == 0) {
             view.basinTone = logRange(jelly.home.z,216.f,286.f);
             const float position = view.basinTone;
             view.basinLight = eased(player.z,153.f+42.f*position,174.f+48.f*position);
             view.pigment.x = std::lerp(.17f,.63f,position)+.09f*(jelly.hue-.5f);
+            view.presence *= 1.f-.36f*eased(player.z,223.f,263.f);
         }
+        const float relativeDepth = depthBlend-float(jelly.realm);
+        float region = 1.f-eased(std::abs(relativeDepth),.24f,.98f);
+        if (gateIndex && relativeDepth > 0.f) {
+            // Keep the very same canopy and veins visible overhead on crossing its rim.
+            region = std::lerp(1.f,.29f,eased(relativeDepth,.03f,.85f))*
+                     (1.f-eased(relativeDepth,1.12f,1.95f));
+            view.bellSystemVisibility = 1.f-eased(skyDepthBlend-float(jelly.realm),.10f,.94f);
+        }
+        if (jelly.realm > 0) {
+            const float adjacent = 1.f-eased(std::abs(relativeDepth+.48f),.52f,1.04f);
+            const auto& gate = passages[jelly.realm-1];
+            const float arrival = eased(player.z,gate.opening.z-17.f,gate.opening.z);
+            const float reveal = 1.f-eased(player.z,gate.opening.z+4.f,gate.opening.z+21.f);
+            const float glimpse = .26f*arrival*reveal*adjacent*
+                                  (1.f-eased(apertureDistance(player,gate),gate.aperture*.55f,gate.aperture));
+            region = std::max(region,glimpse);
+        }
+        view.presence *= region;
     }
     return view;
 }
 Jelly Ocean::bodyView() const {
     const float freshness = std::max(0.f,clock-lastPulse);
-    const Vec body = player+Vec{0,.095f*std::sin(clock*2.35f),0};
-    return {packed(body,playerSize),{.93f,clock*2.34f,ease(1.f-freshness*.58f),0.f},
-        {dot(tailSlip,cross({0,1,0},facing(bodyYaw,0)))*.09f,bodyYaw,1.f,.7f},
-        packed(tailSlip),1.f};
+    const float scale = descentScale(depthBlend);
+    const Vec body = player+Vec{0,(.095f+.041f*strokeEffort)*std::sin(swimPhase)*scale,0};
+    const float sway = dot(tailSlip,cross({0,1,0},facing(bodyYaw,0)))*.09f+bodyBank;
+    Jelly view{packed(body,playerSize*scale),{.93f,swimPhase,ease(1.f-freshness*.58f),0.f},
+               {sway,bodyYaw,1.f,.7f},packed(tailSlip,strokeEffort),1.f};
+    view.pitch = bodyPitch;
+    view.bellSystemVisibility = systemEmergence();
+    if (view.bellSystemVisibility > 0.f) view.bellSystem = float(bellSystemSlots.back()+1);
+    if (returnFlight > 0.f)
+        view.pigment.z = std::max(view.pigment.z,eased(returnFlight,.075f,.27f)*(1.f-eased(returnFlight,.49f,.78f)));
+    if (transforming()) {
+        const float progress = transformationProgress();
+        const float settling = eased(progress,0.f,.48f);
+        view.position = packed(body+(player-body)*settling,transformationRadius(progress,scale));
+        view.pigment.y += (clock-transformationStart)*.6f;
+        view.presence = 1.f-eased(progress,.24f,.52f);
+        view.flow.x *= 1.f-settling;
+        view.pitch *= 1.f-settling;
+    }
+    return view;
 }
 void Ocean::captureTrailRow(TrailPose* row) const {
     const Quad time{clock,callCharge(),0,0};
@@ -1012,20 +1723,24 @@ std::span<const Jelly> Ocean::shoal(const Scene& view, std::span<Jelly,trailActo
     const float topPlane = std::sqrt(1.f+vertical*vertical);
     std::size_t count = 0;
     for (const auto& jelly : animals) {
-        const auto visual = animalView(jelly);
+        auto visual = animalView(jelly);
+        visual.presence *= (1.f-view.cycle.z)*view.basinArrival;
         if (visual.presence <= 0.f) continue;
         // Keep the full tentacle span visible even with the bell outside the view.
         const Vec centre = jelly.p+Vec{0,-1.63f*jelly.size,0}-camera;
         const float radius = 4.6f*jelly.size;
         const float depth = dot(centre,forward);
-        const float viewRange = jelly.size >= basinGiantSize ? 238.f : 112.f;
+        const float viewRange = visual.membraneAnchor > 0.f ? 226.f*std::max(1.f,jelly.size/40.f) :
+                                jelly.size >= basinGiantSize ? 238.f : 112.f;
         if (depth+radius < .12f || length(centre)-radius > viewRange ||
             std::abs(dot(centre,right)) > depth*horizontal+radius*sidePlane ||
             std::abs(dot(centre,up)) > depth*vertical+radius*topPlane)
             continue;
         storage[count++] = visual;
     }
-    storage[count++] = bodyView();
+    auto body = bodyView();
+    body.presence *= view.basinArrival;
+    if (body.presence > 0.f) storage[count++] = body;
     return storage.first(count);
 }
 } // namespace pelagic

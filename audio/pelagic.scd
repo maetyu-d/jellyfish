@@ -1,9 +1,10 @@
-SynthDef(\pelagic_bed, { |out = 0, pitch = 33, amp = 0.3, water = 0.2, colour = 0, charge = 0, basin = 0|
+SynthDef(\pelagic_bed, { |out = 0, pitch = 33, amp = 0.3, water = 0.2, colour = 0, charge = 0, basin = 0, passage = 0|
     var root = Lag.kr(pitch, 2.4).midicps;
     var tide = Lag.kr(water, 1.5);
     var depth = Lag.kr(colour, 3);
     var held = Lag.kr(charge, 0.25);
     var opening = Lag.kr(basin, 3.8);
+    var membrane = Lag.kr(passage, 0.57);
     var swell = SinOsc.kr([0.064, 0.078], [0, 1.4]).range(0.52, 1);
     var undertow = SinOsc.ar(root * [0.999, 1.001], [0, 0.31], 0.17 * swell);
     var ratios = [2, 3.001, 4, 5.945] * [1, 1 + (depth * 0.009), 1, 1 + (depth * 0.045)];
@@ -16,7 +17,10 @@ SynthDef(\pelagic_bed, { |out = 0, pitch = 33, amp = 0.3, water = 0.2, colour = 
     var glints = pearl * SinOsc.kr([0.12, 0.097], [1.4, 5.1]).range(0, 1).pow(5) * (0.012 + (tide * 0.027));
     var lantern = SinOsc.ar(root * [6.00, 8.018], SinOsc.ar(root * 0.76, 0, 0.23)) *
         SinOsc.kr([0.031, 0.038], [0, 1.8]).range(0.15, 1) * 0.055 * opening;
-    var body = undertow + chord + air + glints + lantern;
+    var ocean = undertow + chord + air + glints + lantern;
+    var passageAir = BPF.ar(PinkNoise.ar([1, 1]), root * [13.05, 16.02], 0.4) * swell * 0.066;
+    var body = (ocean * (1 - (0.7 * membrane))) +
+        (membrane * (LPF.ar(ocean, 470 + (root * 5)) * 0.7 + passageAir));
     var wet = FreeVerb2.ar(body[0], body[1], 0.63, 0.89, 0.56);
     var fade = EnvGen.kr(Env([0, 1], [2.3], \sine));
     Out.ar(out, HPF.ar(body + (0.44 * wet), 26) * amp * fade);
@@ -45,4 +49,17 @@ SynthDef(\pelagic_call, { |out = 0, pitch = 42, amp = 0.24, sustain = 5, pan = 0
     var voice = Pan2.ar((partials + foam) * shape * amp, pan);
     var water = FreeVerb2.ar(voice[0], voice[1], 0.72, 0.94, 0.43);
     Out.ar(out, HPF.ar(voice + (0.59 * water), 25));
+})
+
+SynthDef(\pelagic_signature, { |out = 0, pitch = 60, amp = 0.28, sustain = 4.3, variant = 0|
+    var notes = (pitch + [0, 5 + (variant * 2), 12]).midicps;
+    var envelopes = [0.003, 0.54, 1.14].collect { |delay|
+        EnvGen.kr(Env([0, 0, 1, 0], [delay, 0.096, 2.66], [\lin, \sine, -4.2]));
+    };
+    var voices = SinOsc.ar(notes, SinOsc.ar(notes * 1.998, 0, 1.12), 0.49) +
+        SinOsc.ar(notes * 3.01, 0, 0.085);
+    var melody = Splay.ar(voices * envelopes * [1, 0.76, 0.63], 0.56);
+    var room = FreeVerb2.ar(melody[0], melody[1], 0.62, 0.91, 0.42);
+    var life = Line.kr(1, 0.98, sustain.max(4.2), doneAction: 2);
+    Out.ar(out, HPF.ar((melody + (0.48 * room)) * amp * life, 45));
 })

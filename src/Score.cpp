@@ -33,6 +33,7 @@ void Score::start(const char* runtime, const char* definitions) {
     waterLevel = .22f;
     charge = 0;
     basin = 0;
+    passage = 0;
     scae_set_transport(engine.get(),60.,0,1);
     bed = scae_note(engine.get(),"pelagic_bed",roots[0],.96f,1.f,31.5f,31.5f,nullptr,0);
     if (bed < 0) {
@@ -62,7 +63,7 @@ void Score::render(float* left, float* right, unsigned frames) {
     }
 }
 
-void Score::update(unsigned nextPalette, Water water, float nextCharge, float nextBasin) {
+void Score::update(unsigned nextPalette, Water water, float nextCharge, float nextBasin, float nextPassage) {
     if (!engine) return;
     scae_maintenance(engine.get());
     nextPalette %= roots.size();
@@ -77,6 +78,8 @@ void Score::update(unsigned nextPalette, Water water, float nextCharge, float ne
         if (scae_control_node(engine.get(),bed,"water",nextWater) > 0) waterLevel = nextWater;
     if (std::abs(nextBasin-basin) > .014f || (nextBasin == 0.f && basin != 0.f))
         if (scae_control_node(engine.get(),bed,"basin",nextBasin) > 0) basin = nextBasin;
+    if (std::abs(nextPassage-passage) > .012f || (nextPassage == 0.f && passage != 0.f))
+        if (scae_control_node(engine.get(),bed,"passage",nextPassage) > 0) passage = nextPassage;
     if (std::abs(nextCharge-charge) > .028f || (nextCharge == 0.f && charge != 0.f)) {
         if (scae_control_node(engine.get(),bed,"charge",nextCharge) > 0) charge = nextCharge;
     }
@@ -87,6 +90,28 @@ void Score::pulse(bool held) {
     const char* instrument = held ? "pelagic_call" : "bell";
     const float pitch = roots[palette]+(held ? 7.f : 24.f);
     scae_note(engine.get(),instrument,pitch,held ? .67f : .48f,held ? 5.f : 2.3f,31.5f,31.5f,nullptr,0);
+}
+
+void Score::resonateBell(unsigned contraction) {
+    if (!engine) return;
+    constexpr std::array<float,3> intervals{-7.f,-5.f,0.f};
+    constexpr std::array<float,3> pan{24.f,39.f,31.5f};
+    constexpr std::array<float,3> strength{.36f,.39f,.45f};
+    const auto i = std::min(contraction,2u);
+    scae_note(engine.get(),"pelagic_call",roots[palette]+intervals[i],strength[i],4.7f,pan[i],31.5f,nullptr,0);
+}
+
+void Score::play(VoyageCue cue) {
+    if (!engine || cue.sound == VoyageSound::None) return;
+    if (cue.sound == VoyageSound::OpeningStroke) {
+        scae_note(engine.get(),"pelagic_call",29.f,.50f,5.6f,31.5f,31.5f,nullptr,0);
+        return;
+    }
+    constexpr std::array<float,5> melodyRoots{57.f,60.f,62.f,64.f,65.f};
+    const float pitch = melodyRoots[cue.system%melodyRoots.size()];
+    const scae_parameter tuning[]{{"variant",float(cue.system%2u)}};
+    const float gain = cue.sound == VoyageSound::SystemBirth ? .60f : .49f;
+    scae_note(engine.get(),"pelagic_signature",pitch,gain,4.3f,31.5f,31.5f,tuning,1);
 }
 
 void Score::echo(const Reply& reply, Vec listener, Vec right, Vec forward) {
