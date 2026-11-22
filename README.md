@@ -2,6 +2,10 @@
 
 A native C++ exploration game. You are a giant jellyfish swimming beneath the light of a nearby star. Moving ribbons and plankton trace the water that carries you. Follow a broad stream, circle an eddy, rest in its still centre, or slip into one of the four giants’ gold wakes.
 
+[![A colossal jellyfish suspended above a ring of luminous wakes against a dark sky](docs/stills/whirlpool-transformation.jpg)](https://youtu.be/SVCQqUjb1_M)
+
+[Watch Three Complete Cycles on YouTube](https://youtu.be/SVCQqUjb1_M) · 17 min · 1080p
+
 The jellyfish have iridescent, scalloped bells, internal anatomy and branching canals. Folded oral arms grow from the web beneath the bell, and fine tentacles emerge in clusters under its scalloped edge. Their membranes bend the colours in nearby starlight, streams and trails by different amounts. Comb jellies carry rippling rows of light along their bodies, and suspended light drifts past at different depths as you swim.
 
 The eight named currents are entry points into 7,714 solar systems. Press N within the atlas to enter the uncharted catalogue. The water colours, light and planets morph continuously, reaching a new environment every 30–60 seconds. Selecting a current from the atlas starts a 12-second morph. You can keep swimming through both changes, and the shoal and its trails stay in place.
@@ -50,6 +54,16 @@ Your bell contracts more strongly as you swim, and your body banks as you turn. 
 The embedded score shifts its tuning and colour as you cross between the nested and open waters. The current changes its texture, a quick pulse rings a bell, a held call produces a lower gliding tone, and shoal replies echo across the stereo field.
 
 The ocean responds to three frequency bands in the engine’s stereo output, using the approach developed for Crimson Mirror / Prism Currents. Bass swells the water ribbons, mids bend them, treble brings out fine detail in the jellyfish and wakes, and attacks send brief glints along the current. **Music → Music-Reactive Ocean** toggles the visual response.
+
+## Gameplay Stills
+
+| Lantern Basin | The Amber Garden |
+| --- | --- |
+| ![Violet and turquoise jellyfish drift beneath the outer bell](docs/stills/lantern-basin.jpg) | ![A magenta jellyfish swims through amber light beside a ringed planet](docs/stills/amber-garden.jpg) |
+
+| The Cobalt Gloam | The Carmine Deep |
+| --- | --- |
+| ![A purple jellyfish drifts beside a green bell glowing against cobalt water](docs/stills/cobalt-gloam.jpg) | ![Gold tentacles hang beneath a translucent blue bell in crimson water](docs/stills/carmine-deep.jpg) |
 
 ## Building
 
