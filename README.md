@@ -135,7 +135,7 @@ Each inward passage requires a total number of distinct restored bubbles and a l
 
 Each passage rolls a pattern with exactly as many colour bubbles as its cumulative target, separated by one to three monochrome bubbles. The HUD uses **C×3** for three consecutive colour bubbles and **M** for one monochrome bubble. For a six-bubble colour target, **C×2 – M – C×4** means two colour bubbles, then one monochrome bubble, then four more colour bubbles. Build one unbranched chain of distinct bubbles in the current layer, working from either end. Saved patterns stay the same when you relaunch.
 
-When the HUD reads **F Pulse chain**, fly within pulse range and tap **F**. A hit on any bubble in the matching chain starts a bell note sequence from its nearer end. The signal lights each link on the way to the next bubble. On the last note, the passage opens and its rim glows in the next layer's monochrome colour. The HUD and the travelling light show the sequence with audio muted.
+When the HUD reads **F Pulse chain**, fly within pulse range and tap **F**. A hit on any bubble in the matching chain starts a bell melody from its nearer end. Each note sends a burst of iridescent colour and sparks from its bubble, and light runs along the link to the next one. The final note makes a bigger burst as the passage opens and its rim glows in the next layer's monochrome colour. The bursts fade back to the bubbles' mission colours.
 
 ### Connecting bubbles
 

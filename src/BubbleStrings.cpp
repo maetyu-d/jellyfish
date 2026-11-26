@@ -14,8 +14,7 @@ namespace {
 constexpr float focal = 1.94f;
 constexpr float nearDepth = .35f;
 constexpr unsigned stringSegments = 24;
-enum class StringFilm { Strand, Target, Knot, Cast, Beam, Harpoon, Chime, Melody };
-constexpr double chimeFlashTime=.58;
+enum class StringFilm { Strand, Target, Knot, Cast, Beam, Harpoon, Chime, Melody, Burst, Finale };
 
 Vec xyz(Quad q) { return {q.x,q.y,q.z}; }
 float dot(Vec a, Vec b) { return a.x*b.x+a.y*b.y+a.z*b.z; }
@@ -271,7 +270,7 @@ std::optional<HarpoonHit> harpoonAt(const Ocean& ocean, const Scene& view, const
 }
 
 struct Attachment {
-    Vec point, normal;
+    Vec point, normal, centre;
     float radius, presence, hue;
 };
 
@@ -295,7 +294,8 @@ std::optional<Attachment> attachment(const Ocean& ocean, const Scene& view, cons
     const Vec direction = anchor.direction;
     if (anchor.system == BubbleAnchor::shell) {
         const auto point = membrane.toWorld(direction*membrane.radius(direction));
-        return Attachment{point,membrane.normal(direction),membrane.innerRadius(1.f),bubble->presence,bubble->pigment.x};
+        return Attachment{point,membrane.normal(direction),membrane.centre,membrane.innerRadius(1.f),
+                          bubble->presence,bubble->pigment.x};
     }
     const auto regions = ocean.regions();
     if (anchor.bubble <= residentSystemCount || anchor.bubble > residentSystemCount+regions.size()) return {};
@@ -303,8 +303,8 @@ std::optional<Attachment> attachment(const Ocean& ocean, const Scene& view, cons
     if (anchor.system < region.firstSystem || anchor.system-region.firstSystem >= region.systems) return {};
     const Quad p = ocean.systemBubbles()[anchor.system].position;
     const float radius = membrane.innerRadius(p.w);
-    return Attachment{systemCentre(membrane,p,anchor.system,view)+direction*radius,direction,radius,
-                      bubble->presence,bubble->pigment.x};
+    const Vec centre = systemCentre(membrane,p,anchor.system,view);
+    return Attachment{centre+direction*radius,direction,centre,radius,bubble->presence,bubble->pigment.x};
 }
 
 float cameraDepth(Vec point, const Scene& view) {
@@ -393,6 +393,22 @@ void drawStroke(std::vector<StringStroke>& strokes, const Segment& section, floa
     strokes.push_back({{section.p.x,section.p.y,section.p.z,section.u},
                        {section.q.x,section.q.y,section.q.z,section.v},
                        {a,b,presence,float(film)}});
+}
+
+void drawColourBurst(std::vector<StringStroke>& strokes, const Attachment& site, const Scene& view,
+                     float progress, unsigned step, bool finale) {
+    // For an enclosing film, place the burst on the string's attachment, where the note originates.
+    const float centreDepth = cameraDepth(site.centre,view);
+    const Vec centre = centreDepth > site.radius ? site.centre : site.point;
+    const float depth = cameraDepth(centre,view);
+    if (depth <= nearDepth) return;
+    const Vec point = project(centre-xyz(view.eye),depth,view);
+    const float radius = std::clamp(focal*site.radius/depth,.025f,finale ? .29f : .19f);
+    const float reach = radius*2.35f;
+    if (std::abs(point.x) > view.screen.x+reach || std::abs(point.y) > 1.f+reach) return;
+    const float hue = site.hue+.273f*float(step);
+    drawStroke(strokes,{centre,centre,point,point,radius,1.f},
+               progress,hue,site.presence,finale ? StringFilm::Finale : StringFilm::Burst);
 }
 
 void drawContact(std::vector<StringContact>& contacts, const Attachment& anchor, const Attachment& other,
@@ -536,6 +552,11 @@ unsigned BubbleStrings::preparePassage(const Ocean& ocean,unsigned restored,cons
 unsigned BubbleStrings::sequenceNotesPlayed() const { return melody ? melody->played : 0u; }
 unsigned BubbleStrings::sequenceLength() const { return melody ? unsigned(melody->chain.size()) : 0u; }
 
+double BubbleStrings::Flash::duration() const {
+    if (finale()) return 1.65;
+    return length ? 1.02 : .58;
+}
+
 void BubbleStrings::beginResonance(unsigned layer) {
     if (!melody) wave=Wave{layer};
 }
@@ -554,11 +575,13 @@ BubbleStrings::ResonanceFrame BubbleStrings::advanceResonance(Ocean& ocean,const
         cancelResonance();
         return frame;
     }
-    std::erase_if(flashes,[now](const Flash& flash) { return now-flash.time>chimeFlashTime; });
+    std::erase_if(flashes,[now,layer](const Flash& flash) {
+        return flash.layer!=layer || now-flash.time>=flash.duration();
+    });
     const auto ring=[&](const BubbleAnchor& anchor,Vec point,unsigned step=0,unsigned length=0) {
         if (const auto id=bubbleIdentity(ocean,anchor)) {
             std::erase_if(flashes,[&](const Flash& flash) { return flash.bubble.sameBubble(anchor); });
-            flashes.push_back({anchor,now});
+            flashes.push_back({anchor,now,layer,step,length});
             frame.chimes.push_back({*id,point,layer,step,length});
         }
     };
@@ -732,10 +755,12 @@ Quad BubbleStrings::compose(const Ocean& ocean, const Scene& view, const ShipPos
         drawContact(contacts,*b,*a,view,targeted);
     }
     for (const auto& flash:flashes) {
-        const float progress=float((now-flash.time)/chimeFlashTime);
-        if (progress>=1.f) continue;
+        const float progress=float((now-flash.time)/flash.duration());
+        if (progress<0.f || progress>=1.f) continue;
         if (const auto site=attachment(ocean,view,flash.bubble); site && site->presence>.08f) {
-            if (const auto point=clip(site->point,site->point,view))
+            if (flash.length)
+                drawColourBurst(strokes,*site,view,progress,flash.step,flash.finale());
+            else if (const auto point=clip(site->point,site->point,view))
                 drawStroke(strokes,*point,progress,0.f,site->presence*(1.f-progress),StringFilm::Chime);
         }
     }

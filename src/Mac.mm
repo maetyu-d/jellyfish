@@ -2338,7 +2338,7 @@ struct MissionMark {
 }
 
 - (void)advanceBubbleResonance:(double)now {
-    if (!_strings.resonanceActive()) return;
+    if (!_strings.hasResonanceEffects()) return;
     if (![self bubbleToolsVisible]) {
         _strings.cancelResonance();
         return;

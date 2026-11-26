@@ -22,8 +22,8 @@ struct BubbleAnchor {
 };
 
 struct StringStroke {
-    Quad start, end; // Unwarped screen coordinates, camera depth and distance along the string (0–1).
-    Quad film;       // Endpoint hues, opacity and material.
+    Quad start, end; // Unwarped screen coordinates, depth and path fraction (screen radius for bursts).
+    Quad film;       // Material parameters, opacity and material.
 };
 
 struct StringContact {
@@ -80,6 +80,7 @@ public:
     unsigned sequenceNotesPlayed() const;
     unsigned sequenceLength() const;
     bool resonanceActive() const { return wave.has_value() || melody.has_value(); }
+    bool hasResonanceEffects() const { return resonanceActive() || !flashes.empty(); }
     void beginResonance(unsigned layer);
     void cancelResonance();
     ResonanceFrame advanceResonance(Ocean&, const Scene&, double now);
@@ -103,7 +104,13 @@ private:
         unsigned layer{}, played{};
         double due{}, spacing{};
     };
-    struct Flash { BubbleAnchor bubble; double time; };
+    struct Flash {
+        BubbleAnchor bubble;
+        double time;
+        unsigned layer, step, length;
+        bool finale() const { return length && step+1 == length; }
+        double duration() const;
+    };
 
     PassageMatch passageMatch(const Ocean&, const PassagePattern&) const;
     std::vector<Link> links;

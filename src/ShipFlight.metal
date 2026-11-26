@@ -856,10 +856,12 @@ vertex StringPixel stringStrokeVertex(uint vertexID [[vertex_id]], uint instance
     const float2 tangent = size > .00001 ? delta/size : float2(1.,0.);
     const float2 normal = float2(-tangent.y,tangent.x);
     const bool knot = stroke.film.w == 2.;
-    const float radius = stroke.film.w == 6. ? .14 : knot ? .073 : stroke.film.w >= 3. ? .037 : .018;
+    const bool burst = stroke.film.w >= 8.;
+    const float radius = burst ? stroke.start.w : stroke.film.w == 6. ? .14 : knot ? .073 :
+                        stroke.film.w >= 3. ? .037 : .018;
     const float2 inv = 1./float2(stroke.start.z,stroke.end.z);
     const float pixel = 2./display.y;
-    const float pad = 3.9*clamp(radius*focal*max(inv.x,inv.y),.86*pixel,.022)+pixel;
+    const float pad = (burst ? 2.35*radius : 3.9*clamp(radius*focal*max(inv.x,inv.y),.86*pixel,.022))+pixel;
     const bool end = (vertexID & 2u) != 0u;
     const float2 local = float2(end ? size+pad : -pad,(vertexID & 1u) ? pad : -pad);
     const float2 point = stroke.start.xy+tangent*local.x+normal*local.y;
@@ -867,17 +869,63 @@ vertex StringPixel stringStrokeVertex(uint vertexID [[vertex_id]], uint instance
             float4(inv,inv*float2(stroke.start.w,stroke.end.w)),stroke.film};
 }
 
+float3 resonanceColour(float hue) {
+    const float3 rgb = saturate(abs(fract(hue+float3(0.,.666667,.333333))*6.-3.)-1.);
+    return rgb*rgb+float3(.018,.012,.025);
+}
+
+float3 resonanceBurst(float2 p, float age, float seed, bool finale) {
+    const float r = length(p);
+    const float angle = atan2(p.y,p.x+.000001);
+    const float expanding = sqrt(age);
+    const float folds = sin(5.*angle+seed*11.)+.55*cos(9.*angle-4.*r);
+    const float3 oil = resonanceColour(seed+angle/tau+.17*r-.26*age+.065*folds);
+    const float strike = exp2(-9.*age);
+    const float face = (1.-smoothstep(.78,1.06,r))*
+        (.38+.62*powr(.5+.5*cos(13.*r-20.*age+folds),2.));
+    const float3 flash = oil*face*strike*1.42+
+        mix(oil,float3(1.,.91,.76),.74)*exp2(-8.2*r*r)*strike*.72;
+
+    // An expanding edge carries iridescence off the film, with a longer echo on the final note.
+    const float crest = r-(.31+1.54*expanding+.036*folds);
+    const float tail = 1.-smoothstep(.28,1.,age);
+    const float ripple = (exp2(-105.*crest*crest)+.29*exp2(-19.*crest*crest))*tail;
+    const float echo = finale ? .46*exp2(-69.*powr(abs(crest+.22),2.))*tail : 0.;
+
+    // Vary the reach and length of each streak so the edge breaks into small sparks.
+    const float sectors = (angle+pi)*(finale ? 33. : 23.)/tau;
+    const float cell = floor(sectors);
+    const float random = fract(sin(17.13*cell+19.47*seed)*4375.121);
+    const float ray = abs(fract(sectors)-mix(.25,.75,random));
+    const float aa = clamp(.6*fwidth(sectors),.035,.28);
+    const float narrow = 1.-smoothstep(.035,.075+aa,ray);
+    const float travel = .46+(1.07+.72*random)*expanding;
+    const float behind = travel-r;
+    const float trail = exp2(-max(0.,behind)/mix(.063,.23,random))*
+                        smoothstep(-.055,.031,behind);
+    const float3 sparks = resonanceColour(seed+random*.83+.31)*
+        (narrow*trail*tail*mix(.18,1.26,random));
+    const float margin = 1.-smoothstep(2.04,2.32,r);
+    return (flash+oil*(.85*ripple+echo)+sparks)*margin*(finale ? 1.53 : 1.);
+}
+
 fragment half4 stringStrokeLight(StringPixel in [[stage_in]], constant Scene& s [[buffer(0)]],
                                  texture2d<half,access::read> hull [[texture(3)]],
                                  texture2d<half,access::read> hullRange [[texture(4)]]) {
     const float size = in.span.x, pixel = in.span.z;
-    const float fraction = saturate(in.local.x/max(.00001,size));
     const float2 inv = in.depthAndPath.xy;
+    const float material = in.film.w;
+    if (material >= 8.) {
+        const float depth = 1./inv.x;
+        const float visibility = in.film.z*exp(-.009*depth)*hullTransmission(depth,uint2(in.p.xy),hull,hullRange);
+        const float3 light = resonanceBurst(in.local/in.span.y,in.film.x,in.film.y,material == 9.);
+        return half4(half3(light*visibility),half(0.));
+    }
+    const float fraction = saturate(in.local.x/max(.00001,size));
     const float depth = 1./mix(inv.x,inv.y,fraction);
     const float2 endpoints = in.depthAndPath.zw/inv;
     const float path = clamp(mix(in.depthAndPath.z,in.depthAndPath.w,fraction)*depth,0.,1.);
     const float endFade = min(path,1.-path);
-    const float material = in.film.w;
     const bool strand = material <= 1.;
     const bool targeted = material == 1.;
     const bool knot = material == 2.;
