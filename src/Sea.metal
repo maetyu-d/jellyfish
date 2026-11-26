@@ -2,7 +2,17 @@
 using namespace metal;
 
 struct Planet { float4 position, material, pigment; float ringOpacity, opacity; };
-struct BellSystem { float4 sun, sunlight; Planet planets[3]; float4 skyPositions[3]; };
+constant uint systemPlanetLimit = 9u;
+struct WorldAppearance { float4 dark, light, features, annulus, pole; };
+struct SystemBubble {
+    float4 position, star;
+    float4 orbits[systemPlanetLimit], colours[systemPlanetLimit], materials[systemPlanetLimit];
+    float4 catalogue;
+    WorldAppearance appearances[systemPlanetLimit];
+};
+float4 catalogueInterior(device const SystemBubble& system, float3 eye, float3 ray,
+                         float membrane, float pixel, float time);
+struct BellSystem { float4 sun, sunlight; Planet planets[3]; float4 skyPositions[3]; float4 region; };
 constant uint bellPassageCount = 5u;
 struct Scene {
     float4 screen, eye, right, up, forward, deep, water, bright, contrast, sun, sunlight, tide;
@@ -32,16 +42,21 @@ struct Scene {
     float whirlpoolApproach;
     float basinArrival;
     float playerSystem;
+    float4 enclosingPalette, interiorPalette, birthPalette;
+    float4 searchlightOrigin, searchlightAxis;
+    float4 heldBubbleCentre, heldSystemCentre;
+    uint heldBubble, heldSystem;
+    uint lockedPassage, openPassage;
+    float4 pulseAxis;
 };
-struct Jelly {
+struct Bubble {
     float4 position, pigment, flow, trail;
     float presence, eclipsing, basinLight, basinTone, pitch, membraneAnchor, bellSystem, bellSystemVisibility;
+    float4 palette;
 };
 struct Tracer { float4 head, tail; float wake, current; };
 struct FlowNode { float4 point, light; };
-struct TrailPose { Jelly jelly; float4 time; };
-struct TrailMark { float4 tip, body, light; }; // Tip/time, origin/size, hue/hero/pulse/presence.
-struct TrailLayout { uint4 history; float lifetime; uint lines, segments; };
+struct TrailPose { float4 position, light, palette; };
 struct Full { float4 p [[position]]; float2 uv; };
 constant float pi = 3.14159265;
 constant float tau = 6.2831853;
@@ -52,15 +67,118 @@ constant uint hybridGraphics = 1u;
 constant uint paintedGraphics = 2u;
 constant uint ultraGraphics = 3u;
 
+constant float3 bubbleLuma = float3(.2126,.7152,.0722);
+
+float3 bubbleChroma(float3 light, float4 palette) {
+    if (palette.w >= 1.) return light;
+    const float value = max(0.,dot(light,bubbleLuma));
+    // A gentle highlight shoulder keeps the locked hue as lights accumulate.
+    const float3 monochrome = palette.rgb * (.40*value/(1.+.28*value));
+    return mix(monochrome,light,palette.w);
+}
+float3 displayBubbleChroma(float3 light, float4 palette) {
+    if (palette.w >= 1.) return light;
+    const float value = saturate(dot(light,bubbleLuma));
+    return mix(palette.rgb*(value*(.50+.50*value)),light,palette.w);
+}
+float bubbleColourAt(float restoredAt,float time) {
+    if (restoredAt < 0.) return restoredAt == -2. ? 1. : 0.;
+    return smoothstep(0.,2.5,time-restoredAt);
+}
+
+constant float3 searchlightColour = float3(.74,.91,1.);
+constant float searchlightSlope = .115;
+constant float searchlightMouth = .012;
+
+float searchlightProfile(float3 point, float axial, float3 axis) {
+    const float3 lateral = point-axis*axial;
+    const float radius = searchlightSlope*(axial+searchlightMouth);
+    const float crossSection = dot(lateral,lateral)/max(.000001,radius*radius);
+    return (1.-smoothstep(.10,1.,crossSection))*(1.-smoothstep(.62,1.,axial));
+}
+
+float searchlightAt(float3 world, constant Scene& s) {
+    const float range = s.searchlightOrigin.w;
+    if (range <= 0.) return 0.;
+    const float3 point = (world-s.searchlightOrigin.xyz)/range;
+    const float axial = dot(point,s.searchlightAxis.xyz);
+    if (axial <= 0. || axial >= 1.) return 0.;
+    return s.searchlightAxis.w*searchlightProfile(point,axial,s.searchlightAxis.xyz)/(1.+12.*axial*axial);
+}
+
+float searchlightFilm(float3 world, float3 normal, constant Scene& s) {
+    const float beam = searchlightAt(world,s);
+    if (beam <= 0.) return 0.;
+    const float3 towardLamp = normalize(s.searchlightOrigin.xyz-world);
+    // Either side of a transparent film can catch the light.
+    const float incidence = abs(dot(normal,towardLamp));
+    return beam*(.28+.72*incidence);
+}
+
+float3 searchlightScatter(float3 ray, constant Scene& s) {
+    const float range = s.searchlightOrigin.w;
+    if (range <= 0.) return float3(0.);
+    const float3 axis = s.searchlightAxis.xyz;
+    const float3 origin = (s.eye.xyz-s.searchlightOrigin.xyz)/range;
+    const float height = dot(origin,axis), climb = dot(ray,axis);
+    float near = 0., far = length(origin)+1.2;
+    if (abs(climb) > .0001) {
+        const float a = -height/climb, b = (1.-height)/climb;
+        near = max(near,min(a,b));
+        far = min(far,max(a,b));
+    } else if (height < 0. || height > 1.) return float3(0.);
+    if (far <= near) return float3(0.);
+
+    // Intersect the actual cone so the narrow beam at the nose gets enough samples.
+    const float3 radial = origin-axis*height, tangent = ray-axis*climb;
+    const float radius = searchlightSlope*(height+searchlightMouth), flare = searchlightSlope*climb;
+    const float a = dot(tangent,tangent)-flare*flare;
+    const float b = dot(radial,tangent)-radius*flare;
+    const float c = dot(radial,radial)-radius*radius;
+    if (abs(a) < .000001) {
+        if (b > .000001) far = min(far,-c/(2.*b));
+        else if (b < -.000001) near = max(near,-c/(2.*b));
+        else if (c > 0.) return float3(0.);
+    } else {
+        const float discriminant = b*b-a*c;
+        if (discriminant > 0.) {
+            const float root = -b-copysign(sqrt(discriminant),b);
+            const float first = min(root/a,c/root), last = max(root/a,c/root);
+            if (a > 0.) {
+                near = max(near,first);
+                far = min(far,last);
+            } else if (near < first) far = min(far,first);
+            else near = max(near,last);
+        } else if (a > 0.) return float3(0.);
+    }
+    if (far <= near) return float3(0.);
+
+    constexpr uint samples = 10u;
+    const float step = (far-near)/float(samples);
+    float light = 0.;
+    for (uint i=0; i<samples; ++i) {
+        const float travel = near+(float(i)+.5)*step;
+        const float axial = height+climb*travel;
+        const float density = (1.+1.8*exp2(-24.*axial))/(1.+18.*axial*axial);
+        light += searchlightProfile(origin+ray*travel,axial,axis)*density;
+    }
+    const float3 tint = mix(searchlightColour,s.interiorPalette.rgb,.30*(1.-s.interiorPalette.w));
+    return tint*(.16*s.searchlightAxis.w*(1.-exp2(-4.8*light*step)));
+}
+
 bool hybridWater(constant Scene& s) {
     return s.graphicsStyle == hybridGraphics || s.graphicsStyle == ultraGraphics;
 }
 constant float3 playerBody[4] = {
-    float3(1.,.008,.15), float3(1.,.008,.31), float3(.024,.14,1.), float3(1.,.24,.006)
+    float3(1.,.083,.021), float3(.34,.86,.024), float3(.081,.17,.99), float3(1.,.086,.14)
 };
 constant float3 playerRim[4] = {
-    float3(1.,.024,.69), float3(.50,.017,1.), float3(.58,.012,1.), float3(1.,.85,.012)
+    float3(1.,.64,.013), float3(.89,1.,.038), float3(.45,.10,1.), float3(1.,.53,.012)
 };
+
+constant float3 sulphur = float3(.83,1.,.033);
+constant float3 ember = float3(1.,.16,.019);
+constant float3 hotMagenta = float3(.98,.020,.43);
 
 float3 paletteColour(float4 blend, constant float3* dyes) {
     return blend.x*dyes[0]+blend.y*dyes[1]+blend.z*dyes[2]+blend.w*dyes[3];
@@ -95,7 +213,9 @@ float3 pigment(float hue) {
 }
 
 float3 hybridPrism(float phase) {
-    return pigment(.705+.243*sin(phase));
+    const float wash = .5+.5*sin(phase);
+    const float heat = .5+.5*sin(phase*.77+1.62);
+    return mix(mix(ember,hotMagenta,smoothstep(.26,.77,heat)),sulphur,smoothstep(.48,.88,wash));
 }
 
 float2 paintStrokes(float2 point) {
@@ -180,7 +300,7 @@ float lunarCrater(float2 p, float2 centre, float radius) {
     return .17*exp2(-65.*(d-.83)*(d-.83))-.28*(1.-smoothstep(.31,.96,d));
 }
 
-float3 lunarLight(float3 water, float3 ray, float pixel, float clarity) {
+float3 lunarLight(float3 water, float3 ray, float pixel, float clarity, float4 palette) {
     if (dot(ray,moonDirection) < .94) return water;
 
     const float2 skyPlane = float2(dot(ray,normalize(cross(float3(0,1,0),moonDirection))),
@@ -190,7 +310,7 @@ float3 lunarLight(float3 water, float3 ray, float pixel, float clarity) {
     const float edge = clamp(pixel/moonRadius+.095*(1.-clarity),.026,.25);
     const float3 pearl = float3(.68,.79,1.);
     const float halo = (.16*exp2(-.75*r*r)+.072*exp2(-.16*r*r))*(1.-smoothstep(4.6,6.,r));
-    const float3 light = water+pearl*halo*clarity;
+    const float3 light = water+bubbleChroma(pearl*halo*clarity,palette);
     if (r >= 1.+edge) return light;
 
     const float3 normal = float3(p,sqrt(max(0.,1.-dot(p,p))));
@@ -204,7 +324,7 @@ float3 lunarLight(float3 water, float3 ray, float pixel, float clarity) {
     const float rock = .49+.39*smoothstep(.32,.76,maria)+.17*dust+craters;
     const float3 disc = mix(float3(.13,.17,.30),mix(pearl,float3(1.,.91,.73),.29),phase)*
                         (rock*(.21+1.34*phase));
-    return mix(light,disc,(1.-smoothstep(1.-edge,1.+edge,r))*clarity);
+    return mix(light,bubbleChroma(disc,palette),(1.-smoothstep(1.-edge,1.+edge,r))*clarity);
 }
 float stellarTransmission(float3 ray, constant Scene& s) {
     if (s.eclipse.w <= 0.) return 1.;
@@ -395,7 +515,7 @@ float2 waterField(float3 ray, constant Scene& s) {
 float3 narrowsFilter(float3 ray, constant Scene& s) {
     const float3 slit = normalize(float3(-4.,-.6,178.)-s.eye.xyz+float3(.001));
     const float opening = pow(saturate(dot(ray,slit)),17.);
-    return mix(float3(1.),mix(float3(.45,.09,.74),float3(.70,.58,.82),opening),
+    return mix(float3(1.),mix(float3(.56,.15,.42),float3(.80,.61,.64),opening),
                s.habitat.y*(.43+.50*s.screen.w));
 }
 
@@ -407,18 +527,15 @@ float4 paintedGroundAt(float3 ray, float3 origin, constant Scene& s) {
     const float2 strokes = paintStrokes(point);
     const float diagonal = noise(point*float2(.36,.83)+float2(4.3,2.1));
     const float light = .22+.55*strokes.x+.23*diagonal;
-    const float warmWater = smoothstep(1.35,2.65,s.tide.z);
-    const float3 indigo = mix(float3(.100,.143,.224),float3(.118,.165,.179),.52*saturate(s.tide.z));
-    const float3 plum = float3(.203,.128,.158);
-    const float3 ground = mix(indigo,plum,max(warmWater*.84,s.habitat.y*.34));
-    float3 water = mix(float3(.039,.041,.065),ground,light);
-    const float3 pigment = s.water.xyz/max(.01,max(s.water.r,max(s.water.g,s.water.b)));
-    water = mix(water,water*(.66+.62*pigment),.55*(1.-s.paletteMix.x));
-    water += (strokes.y-.5)*float3(.038,.043,.055);
+    const float3 dye = s.water.xyz/max(.01,max(s.water.r,max(s.water.g,s.water.b)));
+    const float3 ash = float3(.041,.027,.032);
+    const float3 ground = ash+dye*(.044+.134*smoothstep(.28,.83,diagonal));
+    float3 water = mix(float3(.014,.010,.016),ground,light);
+    water += (strokes.y-.5)*float3(.031,.022,.023);
     if (s.habitat.x > .5) {
         const float3 opening = normalize(float3(0.,5.,266.)-s.eye.xyz+float3(.001));
         const float wash = pow(saturate(dot(ray,opening)),4.6)*s.habitat.z;
-        water += wash*(.24+.76*diagonal)*float3(.032,.047,.068);
+        water += wash*(.24+.76*diagonal)*mix(ember,s.bright.xyz,.74)*.055;
     }
     return float4(water,strokes.y);
 }
@@ -437,7 +554,8 @@ float3 paintedOcean(float3 ray, constant Scene& s) {
     const float3 lit = max(celestialLight-water,0.);
     const float pigmentLoad = max(0.,dot(lit,float3(.32,.50,.18))-.012);
     const float warm = smoothstep(.035,.62,lit.r-lit.b);
-    const float3 chalk = mix(float3(.70,.80,.89),float3(.94,.82,.73),warm);
+    const float3 mineral = mix(float3(.59,.69,.78),float3(.96,.72,.48),warm);
+    const float3 chalk = mix(mineral,lit/max(.01,max(lit.r,max(lit.g,lit.b))),.47);
     return min(celestialLight,water)+chalk*(1.-exp2(-2.8*pigmentLoad))*(.68+.30*ground.w);
 }
 
@@ -485,12 +603,12 @@ float3 luminousWater(float3 ray, constant Scene& s) {
         const float fold = 4.6*dot(ray,float3(-.22,.91,.28))-.10*t+s.tide.x*3.2;
         const float3 prism = hybridPrism(sweep+.91*sin(fold));
         const float density = max(brush.r,max(brush.g,brush.b));
-        float3 painted = brush.xyz*.84+prism*(.067+.31*density+.017*s.music.x);
+        float3 painted = brush.xyz*.86+prism*(.029+.18*density+.012*s.music.x);
         if (opening) {
             const float3 dye = s.water.xyz/max(.01,max(s.water.r,max(s.water.g,s.water.b)));
-            const float3 stain = density*(.23+1.1*dye);
-            const float3 shimmer = mix(prism,dye,.78)*(.044+.21*density+.017*s.music.x);
-            painted = mix(painted,stain+shimmer,.86);
+            const float3 stain = density*(.17+.98*dye);
+            const float3 shimmer = mix(prism,dye,.88)*(.021+.16*density+.012*s.music.x);
+            painted = mix(painted,stain+shimmer,.91);
         }
         const float3 ground = paintAsLight(painted);
         water = mix(ground/transmission+stars,water,originalWaterOpacity);
@@ -501,8 +619,8 @@ float3 luminousWater(float3 ray, constant Scene& s) {
         const float lantern = pow(saturate(dot(ray,basin)),3.);
         const float window = pow(saturate(dot(ray,normalize(basin+float3(.27,.16,0.)))),7.);
         const float spread = s.habitat.z*s.habitat.z*originalWaterOpacity;
-        water += spread*(lantern*mix(float3(.013,.068,.21),float3(.015,.20,.24),field)*
-                         (.32+.49*undersea)+float3(.15,.29,.013)*window*field*.38);
+        water += spread*(lantern*mix(s.water.xyz,s.contrast.xyz,field)*(.061+.142*undersea)+
+                         sulphur*window*field*.037);
     }
     return water;
 }
@@ -525,22 +643,25 @@ float3 waterColumn(float3 water, float3 ray, constant Scene& s) {
     const float3 sample = s.eye.xyz+ray*39.;
     const float exposed = upperWater(sample.y);
     const float overhead = smoothstep(-.21,.72,ray.y);
-    const float3 abyss = float3(.035,.085,.175);
-    const float3 colour = water*mix(abyss,float3(1.10,1.22,1.32),exposed)+
-                          float3(.0014,.003,.011)*(1.-exposed);
+    const float3 abyss = float3(.055,.040,.061);
+    const float3 attenuation = mix(abyss,float3(1.06,1.08,1.09),exposed);
+    const float4 palette = s.interiorPalette;
+    const float3 colour = water*mix(float3(dot(attenuation,bubbleLuma)),attenuation,palette.w)+
+                          bubbleChroma(s.deep.xyz*.18*(1.-exposed),palette);
     const float pixel = max(length(dfdx(ray)),length(dfdy(ray)));
     const float2 field = sample.xz*.128+sample.y*float2(.069,-.041);
     const float footprint = length(fwidth(field));
     const float clarity = mix(.28,.89,upperWater(s.eye.y+5.));
-    if (exposed <= 0.) return lunarLight(colour,ray,pixel,clarity);
+    if (exposed <= 0.) return lunarLight(colour,ray,pixel,clarity,palette);
     const float2 caustic = refractedWater(field,s.celestialTime*.24,footprint);
     const float3 prism = hybridPrism(field.x*.88+field.y*.53-.24*s.celestialTime+.8*caustic.x);
-    const float3 enamel = mix(mix(s.water.xyz,s.bright.xyz,.56),prism,.49);
+    const float prismAmount = s.habitat.x > .5 ? .17 : .33;
+    const float3 enamel = mix(mix(s.water.xyz,s.bright.xyz,.56),prism,prismAmount);
     const float glow = exposed*(.28+.72*overhead)*(.059*caustic.x+.14*caustic.y);
-    return lunarLight(colour+enamel*glow,ray,pixel,clarity);
+    return lunarLight(colour+bubbleChroma(enamel*glow,palette),ray,pixel,clarity,palette);
 }
 
-float bellIntersection(float3 eye, float3 ray, float3 axes, float hemisphere) {
+float membraneIntersection(float3 eye, float3 ray, float3 axes) {
     const float3 p = eye/axes, d = ray/axes;
     const float a = dot(d,d), b = dot(p,d), c = dot(p,p)-1.;
     const float discriminant = b*b-a*c;
@@ -548,9 +669,7 @@ float bellIntersection(float3 eye, float3 ray, float3 axes, float hemisphere) {
     const float root = sqrt(discriminant);
     const float entry = (-b-root)/a;
     const float exit = (-b+root)/a;
-    if (entry > 0. && (eye.y+ray.y*entry)*hemisphere >= 0.) return entry;
-    if (exit > 0. && (eye.y+ray.y*exit)*hemisphere >= 0.) return exit;
-    return -1.;
+    return entry > 0. ? entry : exit;
 }
 
 float3 containedCentre(float3 direction, float depth) {
@@ -668,119 +787,97 @@ float4 containedSky(float3 eye, float3 ray, float membrane, float pixel, constan
     return float4(light,coverage);
 }
 
-float3 enclosingWater(float3 ray, float3 water, constant Scene& s, constant BellSystem& system) {
-    // Trace the inner face of a world-space bell. Normalized distances keep the intersection precise.
-    const float time = s.celestialTime;
-    const float pixel = max(length(dfdx(ray)),length(dfdy(ray)));
+struct BubbleFilm {
+    float3 colour;
+    float edge, body, gloss, phase;
+};
+
+BubbleFilm bubbleFilm(float3 normal, float3 view, float3 sun, float3 dye, float time) {
+    const float facing = saturate(abs(dot(normal,view)));
+    const float edge = pow(1.-facing,2.45);
+    const float sheet = dot(normal,float3(.48,.86,-.27));
+    const float2 surface = normal.xy*2.7+normal.z*float2(1.7,-1.4);
+    const float warp = noise(surface+float2(.058*time,-.041*time))-.5;
+    const float phase = 4.4*facing+3.9*sheet+.92*sin(sheet*3.8+time*.38)+1.9*warp;
+    const float3 spectrum = hybridPrism(phase);
+    const float3 reflected = reflect(-view,dot(normal,view) >= 0. ? normal : -normal);
+    const float sunward = saturate(dot(reflected,sun));
+    const float gloss = .84*pow(sunward,62.)+.26*pow(sunward,12.);
+    const float sheen = smoothstep(.18,.80,.5+.5*sin(phase*.86-.42));
+    const float etch = smoothstep(.66,.96,.5+.5*sin(phase*1.41+.26));
+    const float3 colour = mix(dye,spectrum,.08+(.21+.16*edge)*etch);
+    return {colour,edge,sheen,gloss,phase};
+}
+
+struct FlightBody { float4 position, colour, surface, axis; WorldAppearance appearance; };
+struct FlightScene {
+    float4 eye, right, up, forward;
+    float4 ship, shipRight, shipUp, shipForward;
+    float4 cabinRight, cabinUp, cabinForward;
+    float4 water, accent, screen, navigation;
+    float4 cabinOffset, controls, optics, drive, stellar, stellarImage, atmosphere;
+    float4 cloudShell, cloudOptics, cloudMotion, cloudProjection;
+    float cloudDeckPhases[16];
+    float4 terrainView, terrainEye, terrainEyeResidual;
+    FlightBody bodies[13];
+};
+
+float4 ziksaInterior(float3 eye, float3 ray, float membrane, float pixel,
+                     constant FlightScene& f, bool showShip);
+
+float3 enclosingWater(float3 ray, float3 water, constant Scene& s, constant BellSystem& system,
+                      constant FlightScene& flight, device const SystemBubble& catalogue) {
     const float3 eye = (s.eye.xyz-s.enclosingBell.xyz)/s.enclosingBell.w;
-    const float breath = sin(time*.266+.51);
-    const float width = s.enclosingShape.x;
-    const float crown = s.enclosingShape.y;
-    const float bowl = s.enclosingShape.z;
-    const float top = bellIntersection(eye,ray,float3(width,crown,width),1.);
-    const float bottom = bellIntersection(eye,ray,float3(width,bowl,width),-1.);
-    const bool dome = top > 0. && (bottom <= 0. || top <= bottom);
-    const float reach = dome ? top : bottom;
+    const float3 axes = s.enclosingShape.xyz;
+    const float reach = membraneIntersection(eye,ray,axes);
     if (reach <= 0.) return water;
     const float shown = s.cycle.y > 0. ? s.enclosingShape.w : 1.;
-    const float layout = s.cycle.y > 0. ? smoothstep(.26,.64,s.cycle.y) : 1.;
-    // The same bodies are traced in bell space on both sides of the membrane.
-    const float4 pocket = containedSky(eye,ray,0.,s.orbitalPixel,system,1.,s.enclosedOrbits,layout);
+    const float3 localRay = normalize(ray/axes);
+    const float4 pocket = catalogueInterior(catalogue,eye/axes,localRay,0.,s.orbitalPixel,s.celestialTime);
     const float3 surface = eye+ray*reach;
-    const float height = dome ? crown : bowl;
-    const float rise = surface.y/height;
-    const float lat = abs(rise);
-    const float angle = atan2(surface.z,surface.x);
-    const float3 normal = normalize(surface/float3(width*width,height*height,width*width));
+    const float3 normal = normalize(surface/(axes*axes));
     const float facing = saturate(abs(dot(normal,ray)));
-    // A pixel sees much more of the surface at the edge of the bell than face-on.
-    const float footprint = reach*pixel/max(.055,facing);
-
-    const float2 sheet = surface.xz*7.4+surface.y*float2(4.9,-8.3);
-    const float tissue = fbm(sheet*.73+float2(time*.019,-time*.012));
-    const float2 caustics = refractedWater(sheet*1.63+float2(tissue*2.,0.),time*.17,footprint*19.);
-    const float folds = sin(7.*angle+rise*6.8+1.3*tissue+breath*.45);
-    const float ribs = 24.*angle+1.04*sin(rise*9.+5.*angle)+1.12*folds*lat;
-    const float fan = (1.-smoothstep(.79,.995,lat))*(.25+.75*tissue);
-    const float ribFootprint = 24.*footprint/max(.12,length(surface.xz));
-    const float ribDetail = 1.-smoothstep(.16,1.12,ribFootprint);
-    const float canals = mix(.12,exp2(-4.9*abs(sin(ribs))),ribDetail)*fan;
-    const float fork = .33+.50*sin(rise*19.-3.*angle);
-    const float capillaries = mix(.09,exp2(-6.5*abs(sin(ribs+fork))),ribDetail) * fan * smoothstep(.11,.53,lat);
-    const float beat = fract(rise*.34-time*.071+tissue*.15+.5)-.5;
-    const float pulse = exp2(-36.*beat*beat);
-
-    // The bell margin wraps continuously around the horizon as viewed from the water inside it.
-    const float skirt = surface.y-.021*sin(angle*13.+breath*.64)-.022*sin(angle*7.-time*.13);
-    const float hem = exp2(-410.*skirt*skirt);
-    const float pleat = skirt+.049+.024*sin(angle*17.+time*.16);
-    const float fringe = exp2(-570.*pleat*pleat)*(.17+.83*caustics.x);
-    const float lamella = exp2(-38.*skirt*skirt)*(.28+.72*tissue);
-
-    // Four horseshoe-shaped organs sit against the curved underside of the dome.
-    const float2 organ = float2((fract(4.*angle/tau+.31)-.5)*2.6,(rise-.47)*2.9);
-    const float contour = length(organ*float2(1.,1.22));
-    const float gap = 1.-smoothstep(.26,.49,-organ.y)*(1.-smoothstep(.09,.31,abs(organ.x)));
-    const float gland = exp2(-75.*(contour-.59)*(contour-.59))*gap;
-    const float lining = exp2(-285.*(contour-.54)*(contour-.54))*gap*(.24+.76*caustics.x);
-    const float fascia = exp2(-5.4*contour*contour);
-
-    const float3 violet = mix(float3(.50,.11,1.),s.bright.xyz,.31);
-    const float3 orchid = mix(float3(.37,.061,.64),s.contrast.xyz,.24);
-    const float3 amber = float3(1.,.43,.108);
-    const float3 flesh = mix(float3(.035,.075,.25),orchid,smoothstep(.26,.77,tissue));
-    const float3 enamel = mix(violet,amber,.67*smoothstep(.52,.89,tissue+.13*folds));
-    const float3 glow = flesh*(.14+.27*caustics.x+.12*fascia)+
-        enamel*(.25*hem+.20*fringe+.071*lamella+.10*capillaries+canals*(.11+.24*pulse))+
-        mix(orchid,amber,.43)*gland*(.17+.28*tissue)+amber*lining*.21+
-        violet*caustics.y*(.039+.16*lamella)*(1.+.32*s.music.w);
-    // Keep distant bodies readable even through the densest organs and folds.
-    const float absorption = (.055+.047*fascia+.078*gland+.047*lamella)*(.57+.43*tissue);
-    const float backdrop = dot(max(water,0.),float3(.213,.715,.072));
-    const float veil = 1./(1.+1.7*backdrop);
-    const float softness = s.graphicsStyle == paintedGraphics ? .46 : 1.;
-    const float3 interior = water*(1.-absorption*softness)+glow*(veil*softness);
     const float space = 1.-s.enclosingSky;
-    if (space <= 0.) return mix(water,mix(interior,pocket.rgb,.91*pocket.w)+pocket.rgb*.19,shown);
-
-    // Light the same surface from outside, where the dome has a visible silhouette.
-    const float grazing = 1.-facing;
-    const float fresnel = grazing*grazing*grazing;
-    const float sun = saturate(.49+.61*dot(normal,s.sun.xyz));
-    const float3 pearl = mix(enamel,s.sunlight.xyz,.27+.28*sun);
-    float3 exterior = water*(.72-.23*fresnel-.17*gland) +
-        flesh*(.26+.64*sun)*(.34+.66*tissue)+glow*(.62+.74*sun) +
-        pearl*(.38*fresnel+.23*hem+.18*fringe+.19*caustics.y*sun);
+    const float3 dye = mix(mix(s.water.xyz,s.bright.xyz,.34),float3(.76,.036,.23),space*.88);
+    const BubbleFilm film = bubbleFilm(normal,-ray,s.sun.xyz,dye,s.celestialTime);
+    const float thickness = .017+.035*film.body;
+    const float opacity = thickness+film.edge*mix(.088,.44,space);
+    const float fog = s.graphicsStyle == paintedGraphics ? .64 : 1.;
+    const float3 soft = film.colour*(.014+.041*film.body+.092*film.edge);
+    const float3 rim = film.colour*(.073*film.body+.76*film.edge);
+    const float3 shine = mix(film.colour,s.sunlight.xyz,.66)*film.gloss*.60;
+    float3 shellLight = (mix(soft,rim,space)+shine)*fog;
     if (s.cycle.y > 0.) {
-        const float phase = s.cycle.y;
-        const float crest = mix(-.43,.76,smoothstep(.37,.84,phase));
-        const float pulse = exp2(-18.*powr(abs(surface.y-crest-.034*folds),2.));
-        const float radiance = smoothstep(.32,.53,phase)*(1.-smoothstep(.84,.982,phase));
-        const float3 opal = mix(float3(.22,.43,1.),float3(1.,.47,.16),.5+.5*folds);
-        const float tracery = (canals+.74*capillaries)*(.32+.90*pulse)+.52*hem+.22*fringe;
-        exterior += radiance*(opal*(tracery+.24*pulse*caustics.x) +
-                              float3(.40,.95,1.)*fresnel*(.19+.57*pulse));
-        exterior += pocket.rgb*(.22+.56*pulse)*radiance;
-        const float signal = (phase-.404)*12.987;
-        const float beatPhase = fract(signal);
-        const float wave = rise-(.04+.92*beatPhase)+.047*folds;
-        const float conduction = exp2(-106.*wave*wave)*smoothstep(0.,.18,beatPhase)*
-            (1.-smoothstep(.74,1.,beatPhase))*smoothstep(.404,.45,phase)*(1.-smoothstep(.610,.681,phase));
-        const float3 impulse = mix(float3(.66,.14,1.),float3(.17,1.,.87),.5+.5*sin(angle*6.+1.57*signal));
-        exterior += conduction*(impulse*(1.18*canals+.75*capillaries)+opal*.44*caustics.y);
+        const float progress = s.cycle.y;
+        const float pulsePhase = fract((progress-.397)*12.987);
+        const float signal = smoothstep(.395,.426,progress)*(1.-smoothstep(.611,.686,progress));
+        const float compression = exp2(-13.*powr(abs(pulsePhase-.29),2.));
+        const float crest = surface.y-mix(-.78,.95,pulsePhase)+.12*cos(film.phase);
+        const float sweep = exp2(-27.*crest*crest)*sin(pi*pulsePhase);
+        const float3 flash = mix(sulphur,ember,film.body);
+        shellLight += signal*(flash*(.33*sweep+.55*film.edge*compression)+pocket.rgb*.17*compression);
         const float3 inlet = (s.returnPassage.xyz-s.enclosingBell.xyz)/s.enclosingBell.w;
         const float3 offset = surface-inlet;
         const float radial = length(cross(offset,s.passageFlow.xyz));
-        const float gathered = s.returnPassage.w*(1.-smoothstep(.95,.982,phase))*exp2(-10.*dot(offset,offset));
-        const float rimGlow = exp2(-360.*(radial-.125)*(radial-.125));
-        exterior += gathered*(float3(.19,.66,1.)*(.33*rimGlow+.34*canals)+opal*(.30*rimGlow+.14*caustics.x));
+        const float gathered = s.returnPassage.w*(1.-smoothstep(.95,.982,progress))*exp2(-10.*dot(offset,offset));
+        const float inletGlow = exp2(-360.*(radial-.125)*(radial-.125));
+        shellLight += gathered*inletGlow*mix(hotMagenta,flash,.62)*.54;
     }
-    const float silhouetteWidth = max(.083,sqrt(3.6*reach*pixel));
-    const float silhouette = smoothstep(0.,silhouetteWidth,facing);
-    const float3 membraneLight = mix(interior,mix(water,exterior,silhouette),space);
-    const float strength = mix(1.,silhouette,space);
-    const float3 body = mix(membraneLight,pocket.rgb,pocket.w*strength*.91)+pocket.rgb*(strength*.19);
-    return mix(water,body,shown);
+    const float pixel = max(length(dfdx(ray)),length(dfdy(ray)));
+    const float silhouette = smoothstep(0.,max(.074,sqrt(3.6*reach*pixel)),facing);
+    const float coverage = mix(1.,silhouette,space)*shown;
+    const float growth = s.cycle.y > 0. ? smoothstep(.71,.92,s.cycle.y) : 1.;
+    const float4 palette = mix(s.birthPalette,s.enclosingPalette,growth);
+    const float3 membrane = water*(1.-fog*opacity)+bubbleChroma(shellLight,palette);
+    const float3 orbit = bubbleChroma(pocket.rgb,s.enclosingPalette);
+    float3 body = mix(membrane,orbit,.91*pocket.w)+orbit*.19;
+    if (s.cycle.y > 0. && s.cycle.y < .92) {
+        const float entry = space > .5 ? reach*length(ray/axes) : 0.;
+        const float4 ziksa = ziksaInterior(eye/axes,localRay,entry,s.orbitalPixel,flight,true);
+        const float3 chamber = membrane*(1.-ziksa.w)+bubbleChroma(ziksa.rgb,s.birthPalette);
+        body = mix(chamber,body,growth);
+    }
+    return mix(water,body,coverage);
 }
 
 float3 interiorWater(float3 ray, constant Scene& s, constant BellSystem* systems) {
@@ -846,9 +943,8 @@ float3 whirlpoolPlume(float3 ray, float3 origin, float time, float breath, float
     const float lighthouse = smoothstep(-.26,1.35,waist.y)*(1.-smoothstep(topLevel*.55,topLevel,waist.y));
     const float plumeGain = .52+1.68*approach;
     const float reach = min(1.,(exit-entry)*.48);
-    const float3 ivory = float3(1.,.92,.72);
-    const float3 cobalt = float3(.18,.33,1.);
-    const float3 shaft = (ivory*core*(1.38+.26*breath)+cobalt*.33*sheath)*lighthouse*reach*plumeGain;
+    const float3 ivory = float3(1.,.98,.75);
+    const float3 shaft = (ivory*core*(1.38+.26*breath)+sulphur*.33*sheath)*lighthouse*reach*plumeGain;
     const float step = (exit-entry)/8.;
     float3 light = 0.;
     for (uint i=0; i<8; ++i) {
@@ -867,10 +963,8 @@ float3 whirlpoolPlume(float3 ray, float3 origin, float time, float breath, float
         const float strands = shell*smoothstep(.14,.94,cos(3.*grain+radius*.21))*(.38+.62*flare);
         const float lightwell = exp2(-2.45*radius*radius/(width*width));
         const float mist = exp2(-.54*radius*radius/(width*width))*drift;
-        const float3 orchid = float3(.80,.035,1.);
-        const float3 gold = float3(1.,.54,.071);
-        const float3 cyan = float3(.090,.74,1.);
-        const float3 prism = mix(orchid,cyan,smoothstep(.26,.83,drift));
+        const float3 gold = float3(1.,.46,.013);
+        const float3 prism = mix(ember,sulphur,smoothstep(.26,.83,drift));
         light += rise*(prism*(.071*mist+.46*strands)+
                        gold*(.080*lightwell+.35*strands)*(1.-.80*smoothstep(4.,24.,level)));
     }
@@ -892,11 +986,10 @@ float3 whirlpoolRim(float3 ray, float3 origin, float radius, float time, float c
     const float foil = exp2(-13.*abs(band));
     const float braid = exp2(-29.*abs(band+.135+.046*sin(4.*angle+time*.81)));
     const float sparks = pow(max(0.,cos(12.*angle-2.1*time)),5.);
-    const float3 cyan = float3(.096,.79,1.);
-    const float3 pearl = float3(1.,.89,.63);
-    const float3 dye = mix(cyan,pearl,.24+.45*sparks+.23*charge);
+    const float3 pearl = float3(1.,.94,.52);
+    const float3 dye = mix(sulphur,pearl,.24+.45*sparks+.23*charge);
     return smoothstep(.035,.32,abs(facing))*smoothstep(.035,.31,travel)*
-          (dye*(foil*(.39+.69*sparks+.75*charge)+.66*braid)+cyan*.11*exp2(-8.*abs(band)));
+          (dye*(foil*(.39+.69*sparks+.75*charge)+.66*braid)+sulphur*.11*exp2(-8.*abs(band)));
 }
 
 float3 whirlpoolLight(float3 ray, constant Scene& s) {
@@ -911,10 +1004,9 @@ float3 whirlpoolLight(float3 ray, constant Scene& s) {
     const float time = s.screen.y;
     const float breath = .5-.5*cos(time*.72);
     const float charge = s.cycle.x;
-    const float3 aqua = float3(.062,.68,1.);
-    const float3 coral = float3(1.,.075,.37);
-    const float3 gold = float3(1.,.60,.12);
-    const float3 core = mix(float3(.97,.75,.38),float3(1.,.97,.88),charge);
+    const float3 acid = mix(sulphur,float3(.15,1.,.45),.29);
+    const float3 gold = float3(1.,.55,.019);
+    const float3 core = mix(float3(1.,.82,.22),float3(1.,.99,.83),charge);
     const float nearby = 1.-smoothstep(6.,24.,distance);
     const float3 column = whirlpoolPlume(ray,origin,time,breath,s.whirlpoolApproach);
     const float closest = -dot(ray,origin);
@@ -927,7 +1019,7 @@ float3 whirlpoolLight(float3 ray, constant Scene& s) {
     const float edge = 1.-smoothstep(spread*.66,spread,impact);
     const float lamp = exp2(-r2*.63);
     const float beam = exp2(-r2*4.2);
-    const float3 beacon = edge*(coral*.15*exp2(-r2*.19)*(1.-.93*nearby)+
+    const float3 beacon = edge*(ember*.15*exp2(-r2*.19)*(1.-.93*nearby)+
                                 gold*lamp*(.20+.14*breath)*(1.-.83*nearby)+
                                 core*beam*(1.27+.37*breath+.60*charge)*(1.-.43*nearby));
 
@@ -946,8 +1038,8 @@ float3 whirlpoolLight(float3 ray, constant Scene& s) {
             const float sheet = exp2(-27.*surface*surface)*lip;
             const float crest = smoothstep(.24,.92,wave)*sheet;
             const float fleck = exp2(-54.*surface*surface)*smoothstep(.87,.999,wave)*lip;
-            funnel += (mix(coral,gold,smoothstep(.78,3.4,radius))*(.053*sheet+.42*crest)+
-                       aqua*(crest*.37+fleck*.58))*(.81+.23*breath);
+            funnel += (mix(ember,gold,smoothstep(.78,3.4,radius))*(.053*sheet+.42*crest)+
+                       acid*(crest*.37+fleck*.58))*(.81+.23*breath);
         }
         funnel *= min(step,1.22)*(1.-.32*nearby);
     }
@@ -958,18 +1050,24 @@ float3 whirlpoolLight(float3 ray, constant Scene& s) {
     const float front = smoothstep(.025,.24,closest);
     const float shoulder = impact-mix(2.05,1.07,charge);
     const float fill = exp2(-27.*shoulder*shoulder)*(charge*.9+.06*breath);
-    const float3 outline = (mix(aqua,core,.20+.60*charge)*border*(.18+.33*charge)+core*fill*.62)*
+    const float3 outline = (mix(acid,core,.20+.60*charge)*border*(.18+.33*charge)+core*fill*.62)*
                             close*front;
     const float3 lip = whirlpoolRim(ray,origin,mix(2.10,1.36,charge),time,charge)*
                        mix(.73,1.10,nearby);
     return (column+beacon+funnel+outline+lip)*presence;
 }
 
-float3 membranePassage(float3 ray, uint gate, constant Scene& s, bool destination = false) {
+float3 emissiveLayerColour(float3 tint) {
+    return tint/max(.01,max(tint.r,max(tint.g,tint.b)));
+}
+
+float3 membranePassage(float3 ray, uint gate, constant Scene& s, float4 palette, bool destination = false) {
     const float4 passage = s.passages[gate];
     if (passage.w <= 0. || abs(ray.z) < .001) return float3(0.);
+    const bool open = s.openPassage == gate+1u;
     const float travel = (passage.z-s.eye.z)/ray.z;
-    const float nearby = 1.-smoothstep(47.,125.,length(s.eye.xyz-passage.xyz));
+    const float range = length(s.eye.xyz-passage.xyz);
+    const float nearby = open ? 1.-smoothstep(54.,178.,range) : 1.-smoothstep(47.,125.,range);
     if (travel <= 0. || nearby <= 0.) return float3(0.);
     const float3 point = s.eye.xyz+ray*travel-passage.xyz;
     const float2 plane = point.xy*float2(1.,1.13)/passage.w;
@@ -981,20 +1079,31 @@ float3 membranePassage(float3 ray, uint gate, constant Scene& s, bool destinatio
     const float detail = noise(plane*3.+float2(.038*t,-.016*t));
     const float2 veils = refractedWater(plane*8.,t*.28,footprint);
     const float well = exp2(-radius*radius*4.5);
+    if (open) {
+        const float edge = radius-.97-.065*(detail-.5)-.027*sin(plane.x*8.+plane.y*4.-t*.44);
+        const float band = exp2(-245.*edge*edge);
+        const float halo = exp2(-17.*edge*edge);
+        const float spill = exp2(-4.5*edge*edge);
+        const float emission = band*(1.45+.67*veils.x)+.40*halo+.13*spill+.045*well;
+        const float breath = .93+.07*sin(t*1.1);
+        const float presence = nearby*smoothstep(.24,4.,travel)*exp(-travel*.0035);
+        return emissiveLayerColour(palette.rgb)*(emission*breath*presence);
+    }
     const float shoulder = radius-.84-.12*detail-.047*sin(plane.x*8.+plane.y*4.-t*.44);
     const float rim = exp2(-322.*shoulder*shoulder);
     const float glow = exp2(-36.*shoulder*shoulder);
-    const float presence = nearby*smoothstep(.24,4.,travel)*exp(-travel*.008);
+    const float presence = nearby*smoothstep(.24,4.,travel)*exp(-travel*.008)*
+                           (s.lockedPassage == gate+1u ? .24 : 1.);
     const float3 light = s.passageColours[gate].xyz;
     const float3 spark = mix(light,destination ? float3(1.,.46,.11) : float3(1.,.93,.80),
                              .63*smoothstep(.33,.76,detail));
     if (destination) {
         const float bone = exp2(-82.*shoulder*shoulder);
-        return (light*(.21*glow+.24*well*veils.x)+spark*rim*(.38+1.27*veils.x)+
-                mix(light,float3(1.,.88,.67),.45)*bone*(.35+.41*veils.y))*presence;
+        return bubbleChroma((light*(.21*glow+.24*well*veils.x)+spark*rim*(.38+1.27*veils.x)+
+                    mix(light,float3(1.,.88,.67),.45)*bone*(.35+.41*veils.y))*presence,palette);
     }
-    return (light*(.16*glow+well*(.12+.39*veils.x+.20*veils.y))+
-            spark*rim*(.08+.51*veils.x))*presence;
+    return bubbleChroma((light*(.16*glow+well*(.12+.39*veils.x+.20*veils.y))+
+                        spark*rim*(.08+.51*veils.x))*presence,palette);
 }
 
 float3 openingWaveLight(float3 ray, constant Scene& s) {
@@ -1018,47 +1127,56 @@ float3 openingWaveLight(float3 ray, constant Scene& s) {
     return (amber*(crest*.89+halo*.12)+opal*fringe*.53)*presence;
 }
 
-float3 whirlpoolSystem(float3 water, float3 ray, constant Scene& s, constant BellSystem* systems) {
+float3 whirlpoolSystem(float3 water, float3 ray, constant Scene& s, device const SystemBubble* catalogues) {
     const float shown = smoothstep(.025,.80,s.innerOcean.w)*(1.-smoothstep(.08,.30,s.cycle.y));
     if (s.playerSystem <= 0. || s.whirlpool.w <= 0. || shown <= 0.) return water;
     const float3 origin = s.whirlpool.xyz+float3(.78,1.25,1.78)*s.whirlpool.w;
     const float3 eye = (s.eye.xyz-origin)/(s.whirlpool.w*4.6);
     if (dot(eye,ray) >= 0. || length(cross(eye,ray)) > 1.12) return water;
-    const float4 orbit = containedSky(eye,ray,0.,s.orbitalPixel,systems[uint(s.playerSystem)-1u],
-                                      shown,float4(0.,0.,0.,.51));
-    return mix(water,orbit.rgb,.92*orbit.w*shown)+orbit.rgb*.14*shown;
+    const float4 orbit = catalogueInterior(catalogues[uint(s.playerSystem)-1u],eye,ray,0.,s.orbitalPixel,s.celestialTime);
+    const float3 light = bubbleChroma(orbit.rgb,s.birthPalette);
+    return mix(water,light,.92*orbit.w*shown)+light*.14*shown;
 }
 
-float3 oceanBeforeTransformation(float3 ray, float2 q, constant Scene& s, constant BellSystem* systems) {
+float4 gateInterior(float3 ray, constant Scene& s, Bubble gate, device const SystemBubble& catalogue);
+
+float3 oceanBeforeTransformation(float3 ray, float2 q, constant Scene& s, constant BellSystem* systems,
+                                 constant FlightScene& flight, device const SystemBubble* catalogues,
+                                 constant Bubble* gates) {
     const bool paintedWorld = s.graphicsStyle == paintedGraphics;
     const float inside = smoothstep(0.,1.,s.skyDepth);
-    float3 water = inside < 1. ? (paintedWorld ? paintedOcean(ray,s) : luminousWater(ray,s)) : float3(0.);
+    const float3 base = inside < 1. ? (paintedWorld ? paintedOcean(ray,s) : luminousWater(ray,s)) : float3(0.);
+    float3 water = bubbleChroma(base,s.enclosingBell.w > 0. ? s.enclosingPalette : s.interiorPalette);
     // Draw the membrane over the complete sky so the light of every star, planet and ring passes through it.
-    if (inside < 1. && s.enclosingBell.w > 0.) water = enclosingWater(ray,water,s,systems[0]);
+    if (inside < 1. && s.enclosingBell.w > 0.) water = enclosingWater(ray,water,s,systems[0],flight,catalogues[0]);
     if (inside > 0.) {
         const float stage = max(1.,s.skyDepth);
         const uint from = uint(stage);
         const float transition = smoothstep(0.,1.,fract(stage));
-        const float3 inner = interiorWater(ray,s,systems);
-        float3 local = bellSky(ray,inner,s,systems[from]);
-        if (from < bellPassageCount && transition > 0.)
-            local = mix(local,bellSky(ray,inner,s,systems[from+1u]),transition);
+        const float3 inner = bubbleChroma(interiorWater(ray,s,systems),s.interiorPalette);
+        const float4 pocket = gateInterior(ray,s,gates[from-1u],catalogues[from]);
+        float3 local = inner*(1.-pocket.a)+bubbleChroma(pocket.rgb,gates[from-1u].palette);
+        if (from < bellPassageCount && transition > 0.) {
+            const float4 next = gateInterior(ray,s,gates[from],catalogues[from+1u]);
+            local = mix(local,inner*(1.-next.a)+bubbleChroma(next.rgb,gates[from].palette),transition);
+        }
         water = mix(water,local,inside);
     }
     for (uint i=0; s.habitat.x > .5 && i+1u < bellPassageCount; ++i) {
         const float distance = float(i)-s.innerOcean.x;
         const float shown = (1.-smoothstep(.19,1.,distance))*smoothstep(-1.9,-1.12,distance);
-        if (shown > 0.) water += membranePassage(ray,i,s)*shown;
+        if (shown > 0.) water += membranePassage(ray,i,s,gates[i].palette)*shown;
     }
     const float finalOpening = smoothstep(3.0,3.82,s.innerOcean.x)*(1.-smoothstep(4.62,5.,s.innerOcean.x));
     if (finalOpening > 0. && s.whirlpool.w > 0.)
-        water += membranePassage(ray,bellPassageCount-1u,s,true)*finalOpening;
+        water += membranePassage(ray,bellPassageCount-1u,s,gates[bellPassageCount-1u].palette,true)*finalOpening;
+    float3 scatter = 0.;
     if (s.innerOcean.y > 0.) {
         const float ripple = .5+.5*sin(length(q)*12.-s.screen.y*.72);
-        water += mix(s.bright.xyz,s.contrast.xyz,ripple)*s.innerOcean.y*(.055+.045*ripple);
+        scatter += mix(s.bright.xyz,s.contrast.xyz,ripple)*s.innerOcean.y*(.055+.045*ripple);
     }
     const float age = s.screen.z;
-    if (age < 5.3) {
+    if (age < 5.3 && s.pulseAxis.w <= 0.) {
         const float3 off = s.player.xyz - s.eye.xyz;
         const float radius = age*s.call.z;
         const float front = dot(ray,off);
@@ -1068,8 +1186,8 @@ float3 oceanBeforeTransformation(float3 ray, float2 q, constant Scene& s, consta
                             s.call.y*.35*exp(-abs(edge+1.3)*1.4)*smoothstep(0.,.5,age);
         const float3 colour = paintedWorld ? mix(float3(.60,.76,.84),float3(.89,.39,.31),s.call.y) :
                               mix(s.bright.xyz,s.contrast.xyz,mix(.16,.66,s.call.y));
-        water += colour*shell*smoothstep(0.,5.,front)*exp(-age*mix(.83,.59,s.call.y))*.35*
-                 (1.-smoothstep(4.,5.3,age));
+        scatter += colour*shell*smoothstep(0.,5.,front)*exp(-age*mix(.83,.59,s.call.y))*.35*
+                   (1.-smoothstep(4.,5.3,age));
     }
     if (s.cycle.w > .22 && s.cycle.w < .44) {
         const float3 offset = s.player.xyz-s.eye.xyz;
@@ -1078,12 +1196,13 @@ float3 oceanBeforeTransformation(float3 ray, float2 q, constant Scene& s, consta
         const float shell = length(cross(ray,offset))-radius;
         const float strength = smoothstep(.22,.31,s.cycle.w)*(1.-smoothstep(.37,.44,s.cycle.w));
         const float scattered = exp2(-.95*abs(shell))+.30*exp2(-.38*abs(shell+1.82));
-        water += mix(s.bright.xyz,float3(.20,.60,1.),.46)*scattered*strength*.34*smoothstep(0.,9.,front);
+        scatter += mix(s.bright.xyz,float3(.20,.60,1.),.46)*scattered*strength*.34*smoothstep(0.,9.,front);
     }
+    water += bubbleChroma(scatter,s.interiorPalette);
     if (s.innerOcean.z == 0. && s.basinArrival > 0.)
         water = mix(water,waterColumn(water,ray,s),s.basinArrival);
-    water += openingWaveLight(ray,s)+whirlpoolLight(ray,s);
-    return whirlpoolSystem(water,ray,s,systems);
+    water += bubbleChroma(openingWaveLight(ray,s)+whirlpoolLight(ray,s),s.interiorPalette);
+    return whirlpoolSystem(water,ray,s,catalogues);
 }
 
 float3 contractionWakes(float3 ray, constant Scene& s) {
@@ -1181,38 +1300,39 @@ float3 waterThroughInlet(float3 water, float3 ray, constant Scene& s) {
                  (transmittance*coverage);
         transmittance *= 1.-coverage;
     }
-    return water*transmittance+light;
+    return water*transmittance+bubbleChroma(light,s.enclosingPalette);
 }
 
 fragment half4 oceanLight(Full in [[stage_in]], constant Scene& s [[buffer(0)]],
-                          constant BellSystem* systems [[buffer(1)]]) {
+                          constant BellSystem* systems [[buffer(1)]],
+                          constant FlightScene& flight [[buffer(2)]],
+                          device const SystemBubble* catalogues [[buffer(5)]],
+                          constant Bubble* gates [[buffer(6)]]) {
     const float2 q = (in.uv*2.-1.)*float2(s.screen.x,-1.);
     const float3 ray = normalize(s.forward.xyz+(s.right.xyz*q.x+s.up.xyz*q.y)/focal);
     const float docking = smoothstep(.86,.982,s.cycle.y);
-    float3 water = s.cycle.z < 1. ? oceanBeforeTransformation(ray,q,s,systems) : float3(0.);
+    float3 water = s.cycle.z < 1. ? oceanBeforeTransformation(ray,q,s,systems,flight,catalogues,gates) : float3(0.);
     if (s.cycle.z > 0.) {
         const float focus = smoothstep(.24,.54,s.cycle.y);
         float3 outside = luminousWater(ray,s)*(1.-.44*focus*(1.-docking))+contractionWakes(ray,s);
         if (docking > 0. && s.graphicsStyle == paintedGraphics)
             outside = mix(outside,paintedOcean(ray,s),docking);
-        water = mix(water,outside,s.cycle.z);
+        water = mix(water,bubbleChroma(outside,s.birthPalette),s.cycle.z);
     }
     if (s.cycle.y > 0. && s.enclosingShape.w > 0.)
-        water = enclosingWater(ray,water,s,systems[0]);
+        water = enclosingWater(ray,water,s,systems[0],flight,catalogues[0]);
+    water += searchlightScatter(ray,s);
     return half4(half3(max(waterThroughInlet(water,ray,s),0.)),1);
 }
 
-struct AnimalFragment {
+struct BubbleFragment {
     float4 p [[position]];
     float3 normal, world;
-    float4 shape [[centroid_perspective]];
-    float2 attachment;
-    float4 pigment;
-    float4 state;
-    float synchrony, scale, presence;
-    float4 lighting;
-    float4 cosmos [[flat]];
-    float4 cosmosShape [[flat]];
+    float4 pigment [[flat]], state [[flat]], lighting [[flat]];
+    float4 cosmos [[flat]], membranePose [[flat]];
+    float2 presenceAndSize [[flat]];
+    float orbitalVisibility [[flat]];
+    float4 palette [[flat]];
 };
 
 float3 projectWorld(float3 point, constant Scene& s) {
@@ -1230,17 +1350,10 @@ float2 rotatePlane(float2 p, float angle) {
     return float2(p.x*a-p.y*b,p.x*b+p.y*a);
 }
 
-float3 jellyOrientation(float3 p, Jelly j) {
+float3 bubbleOrientation(float3 p, Bubble j) {
     if (j.flow.z > 0.) p.xy = rotatePlane(p.xy,-.27*j.flow.x);
     if (j.pitch != 0.) p.yz = rotatePlane(p.yz,j.pitch);
     return rotateY(p,j.flow.y);
-}
-
-float3 jellyLocalVector(float3 p, Jelly j) {
-    p = rotateY(p,-j.flow.y);
-    if (j.pitch != 0.) p.yz = rotatePlane(p.yz,-j.pitch);
-    if (j.flow.z > 0.) p.xy = rotatePlane(p.xy,.27*j.flow.x);
-    return p;
 }
 
 float2 patch(uint i, uint cols, uint rows) {
@@ -1292,7 +1405,7 @@ float3 currentPigment(float3 light, float phase, float colourAmount, constant Sc
     // Convert the thin, premultiplied strokes at the brightness of the painted ground.
     if (!hybridWater(s)) return light;
     const float peak = max(light.r,max(light.g,light.b));
-    const float rainbow = s.habitat.x > .5 ? .42*colourAmount : colourAmount;
+    const float rainbow = s.habitat.x > .5 ? .24*colourAmount : .70*colourAmount;
     return .51*mix(light,hybridPrism(phase)*peak*1.12,rainbow);
 }
 
@@ -1323,16 +1436,16 @@ fragment half4 sheetLight(Ribbon in [[stage_in]], constant Scene& s [[buffer(0)]
     const float depth = smoothstep(1.4,6.,in.depth)*exp2(-in.depth*.014);
     const float presence = currentOpacity*in.light.w*depth*silk*transmissionAmount*(1.-s.cycle.z)*s.basinArrival;
     const bool brush = s.graphicsStyle != 0u;
-    const float3 base = brush ? float3(.30,.48,.63) :
-                        mix(float3(.009,.53,1.),float3(.022,1.,.74),s.habitat.z);
+    const float3 base = brush ? float3(.35,.19,.18) : mix(ember,sulphur,s.habitat.z);
     const float tint = s.habitat.x > .5 ? .82 : (1.-s.screen.w)*(brush ? .38 : .78);
     const float3 dye = mix(base,mix(s.water.xyz,s.bright.xyz,.57),tint);
-    const float3 foldTint = mix(dye,brush ? float3(.56,.30,.36) : s.contrast.xyz,.14+.14*layer);
-    const float3 sheen = mix(foldTint,brush ? float3(.73,.79,.85) : float3(.36,.94,1.),.23+.24*iridescence);
+    const float3 foldTint = mix(dye,s.contrast.xyz,.14+.14*layer);
+    const float3 sheen = mix(foldTint,s.bright.xyz,.23+.24*iridescence);
     const float3 light = foldTint*.021+
                          sheen*cord*(.122+.064*iridescence+crest*(.30+.23*s.music.w));
     const float colourPhase = drift*.264+layer*1.12;
-    return half4(half3(currentPigment(light,colourPhase,.56,s)*depthLight(in.height,s)*presence),0);
+    return half4(half3(bubbleChroma(currentPigment(light,colourPhase,.56,s)*
+                       depthLight(in.height,s),s.interiorPalette)*presence),0);
 }
 vertex Ribbon currentVertex(uint id [[vertex_id]], constant Scene& s [[buffer(0)]],
                             device const FlowNode* field [[buffer(3)]],
@@ -1390,15 +1503,16 @@ fragment half4 currentLight(Ribbon in [[stage_in]], constant Scene& s [[buffer(0
                              transmissionAmount*(1.-s.cycle.z)*s.basinArrival;
     const float strength = (guide ? 1.14 : stream ? .94 : eddy ? .65 : .81)*
                            (.81+.19*saturate(speed*.46));
-    float3 body = guide ? mix(float3(.007,.56,1.),s.bright.xyz,s.habitat.z*.53) :
+    const float guideTint = mix(.18,.89,smoothstep(.38,1.07,s.innerOcean.x));
+    float3 body = guide ? mix(sulphur,s.bright.xyz,guideTint) :
                         stream ? mix(s.water.xyz,s.bright.xyz,.64) :
                         eddy ? mix(s.water.xyz,s.contrast.xyz,.79) : float3(.92,.28,.019);
-    float3 highlight = guide ? mix(float3(.018,.92,1.),s.bright.xyz,s.habitat.z*.32) :
+    float3 highlight = guide ? mix(sulphur,s.bright.xyz,guideTint) :
                              stream ? mix(s.bright.xyz,s.contrast.xyz,.16+.14*ripple) :
                              eddy ? mix(s.contrast.xyz,s.bright.xyz,.25) : float3(1.,.73,.12);
     if (brush) {
-        body = stream ? float3(.30,.43,.58) : eddy ? float3(.53,.33,.43) : float3(.65,.38,.30);
-        highlight = mix(body,float3(.86,.83,.78),.54);
+        body = guide ? body : body*.84;
+        highlight = mix(highlight,float3(.93,.70,.47),.10);
     }
     if (stream) {
         const float tint = s.habitat.x > .5 ? (guide ? .80 : .73) :
@@ -1406,8 +1520,8 @@ fragment half4 currentLight(Ribbon in [[stage_in]], constant Scene& s [[buffer(0
         body = mix(body,mix(s.water.xyz,s.bright.xyz,.59),tint);
         highlight = mix(highlight,s.bright.xyz,tint);
     }
-    body = mix(body,float3(.91,.19,.038),destination);
-    highlight = mix(highlight,float3(1.,.65,.18),destination);
+    body = mix(body,mix(ember,sulphur,.66),destination);
+    highlight = mix(highlight,sulphur,destination);
     const float3 foam = mix(highlight,float3(1.,.92,.77),.19);
     const float3 light = body*haze*(.129+.094*silk) +
                          highlight*threads*edge*(.27+.17*silk+.16*s.music.z) +
@@ -1415,941 +1529,420 @@ fragment half4 currentLight(Ribbon in [[stage_in]], constant Scene& s [[buffer(0
     const float colourPhase = travel*.23+in.light.y*.79;
     const float3 colour = currentPigment(light,colourPhase,stream ? .57 : eddy ? .38 : .17,s);
     const float3 gleamDownstream = (highlight*threads*edge*.35+foam*gleam*1.68)*destination;
-    return half4(half3((colour*depthLight(in.height,s)+gleamDownstream)*(visibility*strength)),0);
+    return half4(half3(bubbleChroma(colour*depthLight(in.height,s)+gleamDownstream,s.interiorPalette)*
+                      (visibility*strength)),0);
 }
 
-float strandSeed(Jelly j, uint strand) { return hash(float(strand)+j.flow.w*43.+19.); }
-bool crownShape(float species) { return (species > .5 && species < 1.5) || species > 4.5; }
-bool foldedArms(float species) { return species > 1.5 && species < 3.5; }
-float bellWidth(Jelly j, float time, float charge) {
+float bubbleWidth(Bubble j) {
     const float kind = j.pigment.w;
-    const float breath = sin(j.pigment.y)+.42*j.pigment.z*sin(time*3.8);
-    const float contraction = (kind > 4.5 ? .038 : .10)+.083*j.trail.w*j.flow.z;
-    const float width = kind > 4.5 ? .83 : kind > 3.5 ? .57 : kind > 1.5 ? 1.21 : kind > .5 ? .83 : 1.;
-    const float stroke = j.membraneAnchor == 1. ? j.trail.w : 0.;
-    return (width+contraction*breath)*(1.-.21*charge*j.flow.z)*(1.-.128*stroke);
+    return kind > 4.5 ? .83 : kind > 3.5 ? .57 : kind > 1.5 ? 1.21 : kind > .5 ? .83 : 1.;
 }
 
-float bellHeight(Jelly j, float time, float charge) {
-    const float kind = j.pigment.w;
-    const float breath = sin(j.pigment.y)+.42*j.pigment.z*sin(time*3.8);
-    const float height = kind > 4.5 ? 1.23 : kind > 3.5 ? 1.75 : kind > 2.5 ? .25 :
-                         crownShape(kind) ? 1.29 : foldedArms(kind) ? .47 : .87;
-    const float stroke = j.membraneAnchor == 1. ? j.trail.w : 0.;
-    return height-(.12+.073*j.trail.w*j.flow.z)*breath+.26*charge*j.flow.z+.20*stroke;
+struct SphereShape { float3 axes, warp; };
+
+SphereShape sphereShape(Bubble j, float charge) {
+    const float phase = j.pigment.y, seed = j.flow.w*tau;
+    const float impulse = j.membraneAnchor == 1. ? j.trail.w : 0.;
+    const float squeeze = max(0.,j.flow.z)*(.15*charge+.085*j.trail.w);
+    const float wobble = sin(phase);
+    const float rise = smoothstep(.18,2.4,abs(j.trail.y));
+    const float height = 1.+.093*wobble-(.12*rise+squeeze)+.24*impulse;
+    const float sideways = 1.+.061*cos(phase+seed);
+    // Redistribute the film around a near-constant volume as the bubble compresses.
+    const float width = bubbleWidth(j)*rsqrt(height);
+    const float3 axes = float3(width*sideways,bubbleWidth(j)*height,width/sideways);
+    const float3 warp = float3(.13*sin(phase+seed),.085*cos(phase-seed),.053*wobble);
+    return {axes,warp};
 }
 
-float bellLobes(float species) {
-    return species > 4.5 ? 18. : species > 3.5 ? 5. : species > 2.5 ? 7. :
-           species > 1.5 ? 8. : species > .5 ? 12. : 16.;
+float sphereRadius(float3 n, float3 warp) {
+    const float split = n.z*n.z-n.x*n.x;
+    return 1.+dot(warp,float3(n.y*(n.x+.62*n.z),split*(.42+n.y),n.x*n.z));
 }
 
-struct BellSurface { float3 point, normal; };
-BellSurface sampleBell(Jelly j, float angle, float polar, float width, float height,
-                       bool underside, bool needNormal) {
-    const float r = sin(polar), c = cos(polar);
-    const float lip = pow(r,7.);
-    const float lobes = bellLobes(j.pigment.w);
-    const float theta = angle*lobes+j.flow.w*tau;
-    const float little = angle*(lobes+8.)+j.flow.w*11.6;
-    const float phase = j.pigment.y;
-    const float st = sin(theta), ct = cos(theta);
-    const float slow = angle*3.+.8*sin(phase);
-    const float cleft = angle*5.+.64*sin(phase);
-    const float petals = j.pigment.w > 2.5 && j.pigment.w < 3.5 ? .25 : 0.;
-    const float scallopDepth = .029+petals+.013*sin(slow);
-    const float scallop = ct*scallopDepth+.008*cos(little)+.014*cos(cleft);
-    const float drift = angle*3.+.86*sin(phase);
-    const float base = crownShape(j.pigment.w) ? 1.10 : .98;
-    const float spread = pow(r,base)*width;
-    const float wall = 1.+lip*scallop+.022*sin(drift)*r*r;
-    const float radius = spread*wall;
-    const float frill = .045*(st+.20*sin(little+phase))+.026*sin(angle*4.+phase);
-    const float neck = r*(1.-r);
-    const float furrow = underside ? .038*st : .068*sin(slow);
-    const float arch = underside ? -.287*(1.-r*r) : height*c*(.95+.088*r*r);
-    const float y = arch+frill*lip+furrow*neck;
-    const float3 radial = float3(cos(angle),0,sin(angle));
-    const float up = underside ? -1. : 1.;
-    const float3 pole = float3(0,up,0);
-    BellSurface surface = {radial*radius+float3(0,y,0),pole};
-    if (needNormal) {
-        const float lipV = 7.*pow(r,6.)*c;
-        const float scallopA = -lobes*st*scallopDepth+.039*ct*cos(slow)-
-                               .008*(lobes+8.)*sin(little)-.070*sin(cleft);
-        const float radiusA = spread*(lip*scallopA+.066*cos(drift)*r*r);
-        const float radiusV = base*pow(max(.0001,r),base-1.)*width*c*wall+
-                              spread*(lipV*scallop+.044*sin(drift)*r*c);
-        const float frillA = .045*(lobes*ct+.20*(lobes+8.)*cos(little+phase))+.104*cos(angle*4.+phase);
-        const float furrowA = underside ? .038*lobes*ct : .204*cos(slow);
-        const float archV = underside ? .574*r*c : height*(-r*(.95+.088*r*r)+.176*r*c*c);
-        const float yA = frillA*lip+furrowA*neck;
-        const float yV = archV+frill*lipV+furrow*c*(1.-2.*r);
-        const float3 tangent = float3(-radial.z,0,radial.x);
-        // The two tangents follow the sculpted surface through every bell contraction.
-        const float3 angular = tangent+(float3(0,yA,0)+radial*radiusA)/max(.02,radius);
-        const float3 vertical = radial*radiusV+float3(0,yV,0);
-        surface.normal = mix(pole,normalize(cross(angular,vertical)*up+pole*.001),smoothstep(0.,.12,r));
+float3 sphereNormal(float3 n, float radius, SphereShape sphere) {
+    const float3 gradient = sphere.warp.x*float3(n.y,n.x+.62*n.z,.62*n.y)+
+                            sphere.warp.y*float3(-2.*n.x*(.42+n.y),n.z*n.z-n.x*n.x,2.*n.z*(.42+n.y))+
+                            sphere.warp.z*float3(n.z,0.,n.x);
+    return normalize((n*(radius+dot(n,gradient))-gradient)/sphere.axes);
+}
+
+float3 bubbleCentre(Bubble j, SphereShape sphere, constant Scene& s) {
+    float3 centre = j.position.xyz;
+    if (j.membraneAnchor > 0.) {
+        // The near pole stays on the original passage through each deformation.
+        const float3 inlet = float3(0.,0.,-1.);
+        centre -= bubbleOrientation(inlet*sphere.axes*sphereRadius(inlet,sphere.warp),j)*j.position.w;
     }
-    return surface;
+    if (s.heldBubbleCentre.w > 0. && s.heldBubble == uint(j.bellSystem))
+        centre = mix(centre,s.heldBubbleCentre.xyz,s.heldBubbleCentre.w);
+    return centre;
 }
 
-float3 jellyWorldPoint(float3 local, Jelly j, float width, float height) {
-    // The entrance sits at the three-quarter marks of the dome's azimuth and profile.
-    if (j.membraneAnchor > 0.) local -= sampleBell(j,.75*tau,.375*pi,width,height,false,false).point;
+float3 bubbleWorldPoint(float3 local, Bubble j, float3 centre) {
     local.x += j.flow.x*local.y*.23;
-    return j.position.xyz+jellyOrientation(local,j)*j.position.w;
+    return centre+bubbleOrientation(local,j)*j.position.w;
 }
 
-float3 tentacleSpine(Jelly j, uint strand, float progress, float width,
-                     float h, float linger) {
-    const float kind = j.pigment.w;
-    const bool disc = foldedArms(kind);
-    const bool crown = crownShape(kind);
-    const bool ribbon = strand < (disc ? 8u : 4u);
-    const float a = float(strand)*2.39996323+j.flow.w;
-    const float root = ribbon ? .26 + h*.13 : .65 + h*.34;
-    const float speciesSpan = kind > 4.5 ? .70 : kind > 2.5 ? .31 :
-                              disc ? .52 : crown ? 1.17 : mix(1.,.76,j.flow.z);
-    const float span = (ribbon ? 2.72+1.0*h : 1.65+2.12*h)*speciesSpan;
-    const float extension = j.flow.z*(ribbon ? .24 : .60)*smoothstep(.10,.88,progress);
-    const float loose = pow(max(.001,progress),1.21);
-    const float curl = progress*(ribbon ? 1.2 : .74)*sin(linger+a);
-    const float dist = root*width+loose*(.13+.42*h) + .18*loose*sin(linger+.37*sin(linger));
-    float3 local = float3(cos(a+curl)*dist,.055-span*progress*(1.+extension),sin(a+curl)*dist);
-    local.x += (sin(linger)*.23+j.flow.x*2.1)*loose;
-    local.z += cos(linger-.29*sin(linger))*loose*.34;
-    return local+jellyLocalVector(j.trail.xyz,j)*float3(.28,.16,.34)*loose;
+float3 gateSpace(float3 p, Bubble gate, float3 axes) {
+    p = rotateY(p,-gate.flow.y);
+    p.yz = rotatePlane(p.yz,-gate.pitch);
+    p.x -= gate.flow.x*p.y*.23;
+    return p/axes;
 }
 
-float2 tentacleAttachment(Jelly j, uint strand, float seed, bool oral) {
-    const float naturalAngle = float(strand)*2.39996323+j.flow.w;
-    if (oral) return float2(naturalAngle,asin(mix(.19,.33,seed)));
-
-    // Gather the fine tentacles into small groups underneath the scallops.
-    const float lobes = bellLobes(j.pigment.w);
-    const float ridge = naturalAngle*lobes+j.flow.w*tau;
-    const float angle = naturalAngle-.79*sin(ridge)/lobes;
-    const float radius = strand%2u == 0 ? mix(.87,.96,seed) : mix(.78,.89,seed);
-    return float2(angle,asin(radius));
+float4 gateInterior(float3 ray, constant Scene& s, Bubble gate, device const SystemBubble& catalogue) {
+    if (gate.position.w <= 0. || catalogue.star.w <= 0.) return float4(0.);
+    const SphereShape sphere = sphereShape(gate,s.call.x);
+    const float3 centre = bubbleCentre(gate,sphere,s);
+    const float3 eye = gateSpace((s.eye.xyz-centre)/gate.position.w,gate,sphere.axes);
+    const float3 localRay = normalize(gateSpace(ray,gate,sphere.axes));
+    return catalogueInterior(catalogue,eye,localRay,0.,s.orbitalPixel,s.celestialTime);
 }
 
-constant float attachmentEnd = .38;
-float3 attachedSpine(Jelly j, uint strand, float3 freeSpine, float progress, float width,
-                     float seed, bool oral, float2 root) {
-    const float angle = float(strand)*2.39996323+j.flow.w;
-    const float looseRadius = (oral ? .26+.13*seed : .65+.34*seed)*width;
-    const float3 original = float3(cos(angle)*looseRadius,.055,sin(angle)*looseRadius);
-    const float3 surface = sampleBell(j,root.x,root.y,width,0.,true,false).point;
-    // Start inside the membrane and ease back to the existing motion below the bell.
-    const float3 buried = surface+float3(0.,oral ? .054 : .037,0.);
-    const float blend = 1.-smoothstep(.047,attachmentEnd,progress);
-    const float stem = smoothstep(0.,.062,progress)*(1.-smoothstep(.10,attachmentEnd,progress));
-    return freeSpine+(buried-original)*blend-float3(0.,(oral ? .035 : .048)*stem,0.);
-}
-float3 tentacleMark(TrailPose sample, uint strand) {
-    const Jelly j = sample.jelly;
-    const float fraction = .93;
-    const float h = strandSeed(j,strand);
-    const float linger = j.pigment.y-fraction*5.1+h*5.9;
-    const float width = bellWidth(j,sample.time.x,sample.time.y);
-    const float3 local = tentacleSpine(j,strand,fraction,width,h,linger);
-    const float height = j.membraneAnchor > 0. ? bellHeight(j,sample.time.x,sample.time.y) : 0.;
-    return jellyWorldPoint(local,j,width,height);
-}
-TrailPose trailAt(device const TrailPose* history, uint4 layout, uint actor, uint past) {
-    const uint row = past == 0 ? layout.z : (layout.x+layout.z-past)%layout.z;
-    return history[row*layout.w+actor];
-}
-kernel void makeTrailMarks(device const TrailPose* history [[buffer(0)]],
-                           device TrailMark* marks [[buffer(1)]],
-                           constant TrailLayout& trails [[buffer(2)]],
-                           uint id [[thread_position_in_grid]]) {
-    const uint4 layout = trails.history;
-    const uint past = id/trails.lines;
-    const uint line = id%trails.lines;
-    const uint extra = line >= layout.w ? line-layout.w : 0;
-    const uint actor = line < layout.w ? line : (extra < 4u ? extra : layout.w-1);
-    const uint strand = line < layout.w ? 9u : (extra == 5u ? 2u : 16u);
-    const TrailPose sample = trailAt(history,layout,actor,past);
-    const Jelly j = sample.jelly;
-    if (line+2u >= trails.lines) {
-        if (sample.time.z <= 0. || sample.time.w < 1.) {
-            marks[id] = {float4(j.position.xyz,sample.time.x),j.position,float4(0)};
-            return;
-        }
-        const uint guest = uint(sample.time.w)-1u;
-        const TrailPose crown = trailAt(history,layout,guest,past);
-        const float3 playerTip = tentacleMark(sample,9u), guestTip = tentacleMark(crown,9u);
-        const float3 gap = guestTip-playerTip;
-        const float3 across = normalize(gap+float3(.001,.002,0.));
-        const float3 up = normalize(cross(across,float3(.03,.08,1.))+float3(0.,.001,0.));
-        const float phase = sample.time.x*2.8;
-        const float radius = min(1.25,length(gap)*.24)*sqrt(sample.time.z);
-        const bool second = line+1u == trails.lines;
-        const float3 twist = (across*cos(phase)+up*sin(phase))*radius*(second ? -1. : 1.);
-        marks[id] = {float4((playerTip+guestTip)*.5+twist,sample.time.x),
-                     (j.position+crown.jelly.position)*.5,
-                     float4(second ? .105 : .48,0.,.80,sample.time.z*1.6)};
-        return;
-    }
-    marks[id] = {float4(tentacleMark(sample,strand),sample.time.x),j.position,
-                 float4(j.pigment.x,j.flow.z,j.pigment.z,j.presence*
-                         (j.basinTone < 0. ? 1. : mix(.12,1.,j.basinLight)))};
-}
-vertex Ribbon streakVertex(uint id [[vertex_id]], constant Scene& s [[buffer(0)]],
-                           device const TrailMark* marks [[buffer(5)]],
-                           constant TrailLayout& trails [[buffer(6)]]) {
-    const uint segment = (id/12)%trails.segments;
-    const uint line = (id/12)/trails.segments;
-    const float2 uv = patch(id%6,1,1);
-    const float u = (float((id/6)%2u)+uv.y)*.5;
-    const TrailMark old = marks[(segment+1)*trails.lines+line];
-    const TrailMark young = marks[segment*trails.lines+line];
-    const float3 jump = old.body.xyz-young.body.xyz;
-    const float span = young.tip.w-old.tip.w;
-    if (span <= .0001 || dot(jump,jump) > 42. || max(old.light.w,young.light.w) <= 0.)
-        return {float4(0,0,-1,1),0,0,0,float4(0)};
-    const uint total = trails.history.y;
-    const TrailMark before = marks[(segment > 0 ? segment-1 : 0)*trails.lines+line];
-    const TrailMark after = marks[min(segment+2,total)*trails.lines+line];
-    const bool hasBefore = segment > 0 && distance(before.body.xyz,young.body.xyz) <= 6.5;
-    const bool hasAfter = segment+2 <= total && distance(after.body.xyz,old.body.xyz) <= 6.5;
-    const float3 p1 = young.tip.xyz, p2 = old.tip.xyz;
-    // Scale tangents by the sample times: the live segment grows from zero every capture.
-    const float3 c = hasBefore ? (p2-before.tip.xyz)*(span/max(span,before.tip.w-old.tip.w)) : p2-p1;
-    const float3 endSlope = hasAfter ? (after.tip.xyz-p1)*(span/max(span,young.tip.w-after.tip.w)) : p2-p1;
-    const float3 a = 2.*(p1-p2)+c+endSlope;
-    const float3 b = 3.*(p2-p1)-2.*c-endSlope;
-    const float3 centre = p1+u*(c+u*(b+u*a));
-    const float3 tangent = c+u*(2.*b+u*3.*a);
-    const float3 ray = normalize(centre-s.eye.xyz+float3(.00001));
-    const float3 side = normalize(cross(tangent,ray)+s.right.xyz*.0001);
-    const float age = saturate((s.screen.y-mix(young.tip.w,old.tip.w,u))/trails.lifetime);
-    const float hero = young.light.y;
-    const float giant = smoothstep(3.1,4.6,young.body.w);
-    const float radius = (.047+.038*max(hero,giant))*(1.+age*1.5);
-    const float across = uv.x*2.-1.;
-    const float3 clip = projectWorld(centre+side*(across*radius),s);
-    const float startTaper = segment > 0 && !hasBefore ? smoothstep(0.,1.,u) : 1.;
-    const float endTaper = hasAfter ? 1. : 1.-smoothstep(0.,1.,u);
-    const float intensity = (.68+.21*giant+.20*hero)*
-                            (1.+mix(young.light.z,old.light.z,u)*.48)*
-                            mix(young.light.w,old.light.w,u);
-    return {float4(clip.xy,clip.z-.25,clip.z),across,clip.z,centre.y,
-            float4(age,young.light.x,hero,intensity*startTaper*endTaper)};
-}
-fragment half4 streakLight(Ribbon in [[stage_in]], constant Scene& s [[buffer(0)]]) {
-    if (in.light.w <= 0.) return half4(0.);
-    const float age = in.light.x;
-    const float hue = in.light.y;
-    const float hero = in.light.z;
-    const float line = in.across;
-    const float n = .5+.5*sin(age*68.+hue*51.);
-    const float diffusion = exp(-line*line*5.)*(1.-smoothstep(.78,1.,abs(line)));
-    const float loosen = smoothstep(.015,.69,age);
-    const float split = (.16+.18*sin(age*25.+hue*38.))*loosen;
-    const float filament = exp(-pow((line+split*.21)*6.6,2.));
-    const float satellite = exp(-pow((line-split-.12)*7.8,2.))*loosen*diffusion;
-    const float gleam = pow(n,7.)*filament;
-    const float rise = smoothstep(0.,.033,age);
-    const float fade = pow(1.-age,1.45)*(1.-smoothstep(.69,1.,age));
-    const float decay = rise*fade*smoothstep(1.,4.3,in.depth)*exp(-in.depth*.017);
-    const float3 dye = mix(pigment(hue+.079+.08*age),paletteColour(s.paletteMix,playerRim),hero);
-    const bool paintedWorld = s.graphicsStyle == paintedGraphics;
-    const float3 trace = paintedWorld ? mix(mix(float3(.46,.65,.78),float3(.90,.52,.43),hero),
-                                         float3(.32,.24,.34),age*.61) :
-                         mix(dye,pigment(hue+.22),age*.30*(1.-hero));
-    const float strength = in.light.w*decay*(1.-s.cycle.z)*s.basinArrival;
-    const float radiance = diffusion*(.19-.048*loosen)+filament*.58+gleam*(.23+.55*s.music.z);
-    const float3 fringe = mix(trace,paintedWorld ? float3(.75,.73,.78) : s.bright.xyz,.48)*satellite*.26;
-    return half4(half3((trace*radiance+fringe)*depthLight(in.height,s)*strength*(1.+.25*s.music.w)),
-                 half(strength*diffusion*.22));
-}
-
-vertex AnimalFragment jellyVertex(uint id [[vertex_id]], uint instance [[instance_id]],
-                                  constant Scene& s [[buffer(0)]],
-                                  device const Jelly* shoal [[buffer(1)]],
-                                  constant uint4& mesh [[buffer(7)]]) {
-    const Jelly j = shoal[instance];
-    const uint steps = mesh.x, sides = mesh.z, slices = mesh.w;
-    const uint rootRows = 4u, rootColumns = 3u;
-    const uint rootSize = rootRows*rootColumns*6;
-    const uint filamentSize = rootSize+(steps-rootRows)*6;
-    const uint armSize = steps*4*6;
-    const uint arms = 8*armSize;
-    const uint tentacles = arms+(mesh.y-8)*filamentSize;
-    const uint organSections = sides/3;
-    const uint organSize = organSections*8*6;
-    const uint organs = organSize*4;
-    const uint lowerShell = sides*(slices/3)*6;
-    const float kind = j.pigment.w;
-    const float phase = j.pigment.y;
-    const bool crown = crownShape(kind);
-    const bool comb = foldedArms(kind);
-    const bool enclosing = j.flow.z <= 0. && s.enclosingBell.w > 0. && j.position.w == s.enclosingBell.w;
-    const float t = enclosing ? s.celestialTime : s.screen.y;
-    const float morph = j.flow.z*smoothstep(.04,.51,s.cycle.y);
-    const float width = enclosing ? s.enclosingShape.x : mix(bellWidth(j,t,s.call.x),s.enclosingShape.x,morph);
-    const float height = mix(bellHeight(j,t,s.call.x),s.enclosingShape.y/.95,morph);
-    float3 local, normal;
-    float4 shape;
-    float2 attachment = 0.;
-    if (id < tentacles) {
-        const bool folded = id < arms;
-        const uint strand = folded ? id/armSize : 8+(id-arms)/filamentSize;
-        const uint cell = folded ? id%armSize : (id-arms)%filamentSize;
-        const float collar = float(rootRows)/steps;
-        float2 uv;
-        if (folded) {
-            uv = patch(cell,4,steps);
-        } else if (cell < rootSize) {
-            uv = patch(cell,rootColumns,rootRows);
-            uv.y *= collar;
-        } else {
-            uv = patch(cell-rootSize,1,steps-rootRows);
-            uv.y = collar+uv.y*(1.-collar);
-        }
-        const float h = strandSeed(j,strand);
-        const bool ribbon = strand < (comb ? 8u : 4u);
-        const float progress = uv.y;
-        const float linger = phase-progress*5.1+h*5.9;
-        local = tentacleSpine(j,strand,progress,width,h,linger);
-        const float naturalAngle = float(strand)*2.39996323+j.flow.w;
-        float2 root = float2(naturalAngle,0.);
-        if (progress < attachmentEnd) {
-            root = tentacleAttachment(j,strand,h,ribbon);
-            if (enclosing) {
-                const float radial = width*sin(root.y);
-                const float3 base = float3(cos(root.x)*radial,-s.enclosingShape.z*cos(root.y),sin(root.x)*radial);
-                local = mix(base+float3(0.,-.58*progress,0.),local,smoothstep(0.,attachmentEnd,progress));
-            } else {
-                local = attachedSpine(j,strand,local,progress,width,h,ribbon,root);
-            }
-            attachment = float2(root.x,root.y*(2./pi));
-        }
-        const float x = uv.x*2.-1.;
-        if (ribbon) {
-            const float unfurl = smoothstep(.021,.25,progress);
-            const float freeTurn = float(strand)*2.37;
-            const float arc = root.x+pi*.5-freeTurn;
-            const float anchorTurn = freeTurn+atan2(sin(arc),cos(arc));
-            const float turn = mix(anchorTurn,freeTurn,unfurl)+unfurl*(progress*8.1+sin(linger)*.9);
-            const float3 across = normalize(float3(cos(turn),unfurl*.22*sin(turn*1.67),sin(turn)));
-            const float3 bow = normalize(cross(across,float3(.18,-1.,.1)));
-            const float fold = .50+.50*sin(progress*(30.+h*17.)+2.*linger+turn*x*.21);
-            const float rootWidth = (.083+.062*h)*width;
-            const float frill = mix(rootWidth,pow(1.015-progress,.65)*(.076+.147*fold),unfurl);
-            const float pleat = progress*56.+x*5.+h*12.;
-            const float curl = x*x*.48*sin(pleat)*unfurl;
-            local += frill*(across*x+bow*((1.-x*x)*mix(.26,.63,unfurl)+curl));
-            normal = normalize(bow+across*(x*(.64+unfurl*(.44-.50*cos(pleat))))+
-                               float3(0,.30*sin(fold*8.)*unfurl,0));
-        } else {
-            const float3 across = jellyLocalVector(s.right.xyz,j);
-            const float3 toward = jellyLocalVector(-s.forward.xyz,j);
-            const float shoulder = 1.-smoothstep(.015,.092,progress);
-            const float thickness = (.009+.016*h)*pow(1.007-progress,.56)+
-                                    (.023+.016*h)*shoulder*width;
-            local += thickness*(across*x+toward*(1.-x*x)*shoulder*.72);
-            normal = normalize(toward+across*x*(.80+.86*shoulder));
-        }
-        shape = float4(uv,ribbon ? 1. : 2.,h);
-    } else if (id < tentacles+organs) {
-        const uint spot = (id-tentacles)/organSize;
-        const float2 uv = patch((id-tentacles)%organSize,organSections,8);
-        const float angle = float(spot)*pi*.5+j.flow.w*.9;
-        const float a = uv.x*tau;
-        const float b = uv.y*tau;
-        const float3 radial = float3(cos(angle),0,sin(angle));
-        const float3 side = cross(float3(0,1,0),radial);
-        const float wing = crown ? .160 : comb ? .113 : .213;
-        const float reach = crown ? .311 : comb ? .171 : .225;
-        const float offset = crown ? .292 : comb ? .335 : .381;
-        const float heart = .99+.115*cos(a)-.088*cos(2.*a);
-        local = radial*(offset+reach*cos(a)*heart)+side*(wing*sin(a)*heart);
-        local *= width;
-        local.y = height*(.36+.14*cos(a))+.038*sin(2.*a+phase);
-        const float3 crossRing = normalize(radial*cos(a)+side*sin(a));
-        const float3 tube = normalize(crossRing*cos(b)+float3(0,sin(b),0));
-        const float pinch = smoothstep(-.94,-.17,cos(a));
-        const float thickness = (.017+.047*pinch)*(1.+.23*sin(3.*a+angle));
-        local += tube*thickness;
-        local.y += .012*sin(4.*a+angle)*sin(b);
-        normal = tube;
-        shape = float4(uv,4.,(float(spot)+.5)*.25);
-    } else {
-        const uint b = id-tentacles-organs;
-        const bool underside = b < lowerShell;
-        const float2 uv = underside ? patch(b,sides,slices/3) : patch(b-lowerShell,sides,slices);
-        const BellSurface surface = sampleBell(j,uv.x*tau,uv.y*pi*.5,width,height,underside,true);
-        local = surface.point;
-        normal = surface.normal;
-        shape = float4(uv,underside ? 3. : 0.,0);
-    }
-    normal.y -= j.flow.x*.23*normal.x;
-    normal = jellyOrientation(normal,j);
-    const float3 point = jellyWorldPoint(local,j,width,height);
-    const float3 clip = projectWorld(point,s);
-    const float3 centre = j.membraneAnchor > 0. ? jellyWorldPoint(float3(0.),j,width,height) : j.position.xyz;
-    const float4 cosmos = float4(centre,j.bellSystem);
-    return {float4(clip.xy,clip.z-.12,clip.z),normal,point,shape,attachment,j.pigment,j.flow,
-            j.trail.w,j.position.w,j.presence,float4(j.eclipsing,j.basinLight,j.basinTone,j.membraneAnchor),
-            cosmos,float4(width,height,j.pitch,j.bellSystemVisibility)};
-}
-
-float periodicLine(float phase, float width) {
-    const float d = abs(fract(phase+.5)-.5);
-    const float footprint = max(.006,fwidth(phase)*.72);
-    return (1.-smoothstep(width,width+footprint,d))*(1.-smoothstep(.19,.57,footprint));
-}
-
-float contractionLight(float phase, float delay) {
-    const float offset = fract(phase/tau+.125-delay)-.5;
-    return exp2(-94.*offset*offset);
-}
-
-struct JellyLight {
-    half4 weighted [[color(0)]];
-    half2 opacity [[color(1)]]; // Membrane opacity and coverage of the moving water details.
+struct WakeBubble {
+    float4 p [[position]];
+    float2 uv;
+    float4 light;
+    float4 palette [[flat]];
 };
 
-float3 bellSpaceVector(float3 vector, AnimalFragment in, float3 axes) {
+vertex WakeBubble bubbleWakeVertex(uint id [[vertex_id]], constant Scene& s [[buffer(0)]],
+                                  device const TrailPose* history [[buffer(5)]],
+                                  constant uint4& layout [[buffer(6)]]) {
+    const uint sample = id/6;
+    const uint past = sample%layout.y, actor = sample/layout.y;
+    const uint row = (layout.x+layout.z-1u-past)%layout.z;
+    const TrailPose birth = history[row*layout.w+actor];
+    const float age = s.screen.y-birth.light.x;
+    const float seed = hash(floor(birth.light.x*11.4+.5)*8.31+float(actor)*2.795);
+    if (age <= 0. || age >= 5.2 || birth.light.w <= 0. || seed < .69)
+        return {float4(0,0,-1,1),float2(0),float4(0),float4(0)};
+    const float2 uv = patch(id%6,1,1)*2.-1.;
+    const float radius = mix(.053,.153,hash(seed*113.))*min(1.9,birth.position.w)*
+                         (1.+.10*age);
+    const float lift = age*mix(.17,.56,hash(seed*719.));
+    const float spread = .54*birth.position.w;
+    const float turn = seed*139.6;
+    const float3 centre = birth.position.xyz+
+        float3(spread*cos(turn)+.14*sin(age*1.7+turn),lift-.61*birth.position.w,spread*sin(turn));
+    const float3 clip = projectWorld(centre+radius*(s.right.xyz*uv.x+s.up.xyz*uv.y),s);
+    const float life = smoothstep(.06,.32,age)*(1.-smoothstep(2.7,5.2,age));
+    const float visibility = smoothstep(1.,3.3,clip.z)*exp(-.026*clip.z);
+    const float3 tint = mix(mix(pigment(birth.light.y),sulphur,.23),s.bright.xyz,.53);
+    return {float4(clip.xy,clip.z-.25,clip.z),uv,float4(tint,life*visibility*birth.light.w),birth.palette};
+}
+
+fragment half4 bubbleWakeLight(WakeBubble in [[stage_in]]) {
+    const float radius = length(in.uv);
+    const float edge = smoothstep(.51,.82,radius)*(1.-smoothstep(.83,1.,radius));
+    const float glint = exp2(-25.*dot(in.uv-float2(-.31,.47),in.uv-float2(-.31,.47)));
+    const float opacity = in.light.w*(.32*edge+.28*glint);
+    const float3 light = bubbleChroma(in.light.xyz*edge+float3(.69,.88,1.)*glint,in.palette);
+    return half4(half3(light*in.light.w*.48),half(opacity));
+}
+
+vertex BubbleFragment bubbleVertex(uint id [[vertex_id]], uint instance [[instance_id]],
+                                   constant Scene& s [[buffer(0)]],
+                                   device const Bubble* bubbles [[buffer(1)]],
+                                   constant uint2& mesh [[buffer(7)]]) {
+    const Bubble j = bubbles[instance];
+    const float morph = max(0.,j.flow.z)*smoothstep(.04,.51,s.cycle.y);
+    SphereShape sphere = sphereShape(j,s.call.x);
+    sphere.axes = mix(sphere.axes,s.enclosingShape.xyz,morph);
+    sphere.warp *= 1.-morph;
+    const float2 uv = patch(id,mesh.x,mesh.y);
+    const float azimuth = uv.x*tau, polar = uv.y*pi;
+    const float ring = sin(polar);
+    const float3 direction = float3(cos(azimuth)*ring,cos(polar),sin(azimuth)*ring);
+    const float radius = sphereRadius(direction,sphere.warp);
+    const float3 local = sphere.axes*direction*radius;
+    float3 normal = sphereNormal(direction,radius,sphere);
+    normal.y -= j.flow.x*.23*normal.x;
+    const float3 centre = bubbleCentre(j,sphere,s);
+    const float3 point = bubbleWorldPoint(local,j,centre);
+    const float3 clip = projectWorld(point,s);
+    return {float4(clip.xy,clip.z-.12,clip.z),bubbleOrientation(normal,j),point,j.pigment,j.flow,
+            float4(j.eclipsing,j.basinLight,j.basinTone,j.membraneAnchor),
+            float4(centre,j.bellSystem),float4(sphere.axes,j.pitch),
+            float2(j.presence,j.position.w),j.bellSystemVisibility,j.palette};
+}
+
+struct BubbleLight {
+    half4 weighted [[color(0)]];
+    half2 opacity [[color(1)]];
+};
+
+float3 bubbleSpace(float3 vector, BubbleFragment in) {
     vector = rotateY(vector,-in.state.y);
-    vector.yz = rotatePlane(vector.yz,-in.cosmosShape.z);
+    vector.yz = rotatePlane(vector.yz,-in.membranePose.w);
     vector.xy = rotatePlane(vector.xy,.27*in.state.x*in.state.z);
     vector.x -= in.state.x*vector.y*.23;
-    return vector/axes;
+    return vector/in.membranePose.xyz;
 }
 
-float4 bellWindow(AnimalFragment in, constant Scene& s, constant BellSystem* systems,
-                  float3 view, float3 normal) {
-    if (in.cosmos.w <= 0. || in.cosmosShape.w <= 0. || (in.shape.z != 0. && in.shape.z != 3.))
-        return float4(0.);
-    const float pixel = s.orbitalPixel;
-    const float3 offset = s.eye.xyz-in.cosmos.xyz;
-    const float resolved = smoothstep(4.,13.,in.scale/max(.12,length(offset)*pixel));
-    if (resolved <= 0.) return float4(0.);
-    const float3 axes = float3(in.cosmosShape.x,max(.19,in.cosmosShape.y)/.85,in.cosmosShape.x);
-    const float3 eye = bellSpaceVector(offset/in.scale,in,axes);
-    const float3 direction = normalize(bellSpaceVector(-view,in,axes));
-    const float inside = 1.-smoothstep(.91,1.08,length(eye/float3(1.,eye.y>=0. ? .85 : .24,1.)));
-    const float facing = mix(smoothstep(.01,.29,dot(normal,view)),1.,inside);
-    if (facing <= 0.) return float4(0.);
-    // Use a smooth optical surface independent of which triangles the current render tier draws.
-    const float3 shell = float3(1.,.86,1.);
-    const float3 p = eye/shell, d = direction/shell;
-    const float a = dot(d,d), b = dot(p,d);
-    const float entry = max(0.,(-b-sqrt(max(0.,b*b-a*(dot(p,p)-1.))))/a);
-    const float membrane = entry*(1.-inside);
-    const bool player = in.state.z > 0.;
-    return containedSky(eye,direction,membrane,pixel,systems[uint(in.cosmos.w)-1u],
-                        player ? in.cosmosShape.w : 1.)*(resolved*facing*(player ? 1. : in.cosmosShape.w));
+float4 bubbleWindow(BubbleFragment in, constant Scene& s, constant BellSystem* systems,
+                    float3 view, float3 eye, float inside, float facing, constant FlightScene& flight,
+                    device const SystemBubble* catalogues) {
+    const bool ziksa = in.state.z < 0.;
+    if (!ziksa && (in.cosmos.w <= 0. || in.orbitalVisibility <= 0.)) return float4(0.);
+    const float size = in.presenceAndSize.y;
+    const float distance = length(s.eye.xyz-in.cosmos.xyz);
+    const float resolved = smoothstep(4.,13.,size/max(.12,distance*s.orbitalPixel));
+    const float visible = resolved*mix(smoothstep(.025,.28,facing),1.-smoothstep(-.20,.08,facing),inside);
+    if (visible <= 0.) return float4(0.);
+    const float3 direction = normalize(bubbleSpace(-view,in));
+    const float3 surface = bubbleSpace((in.world-s.eye.xyz)/size,in);
+    const float entry = max(0.,dot(direction,surface))*(1.-inside);
+    if (ziksa) return ziksaInterior(eye,direction,entry,s.orbitalPixel,flight,true)*visible;
+    const uint slot = uint(in.cosmos.w)-1u;
+    if (systems[slot].region.w > 0.) return float4(0.);
+    if (catalogues[slot].star.w <= 0.) return float4(0.);
+    return catalogueInterior(catalogues[slot],eye,direction,entry,s.orbitalPixel,s.celestialTime)*
+           (visible*in.orbitalVisibility);
 }
 
-void combineBellWindow(thread float3& light, thread float& opacity, float4 pocket) {
-    light = mix(light,pocket.rgb*.72,.80*pocket.w)+pocket.rgb*.20;
-    opacity = max(opacity,.68*pocket.w);
+struct SystemBubbleFragment {
+    float4 position [[position]];
+    float2 local;
+    float4 tint [[flat]];
+    float3 lockedTint [[flat]];
+    float2 depthAndYaw [[flat]];
+    uint system [[flat]];
+    float4 sphere [[flat]];
+};
+
+vertex SystemBubbleFragment systemBubbleVertex(uint id [[vertex_id]], uint index [[instance_id]],
+                                              constant Scene& s [[buffer(0)]],
+                                              device const Bubble* bubbles [[buffer(1)]],
+                                              device const SystemBubble* systems [[buffer(2)]],
+                                              constant uint& parentIndex [[buffer(3)]],
+                                              constant BellSystem* skies [[buffer(4)]]) {
+    const Bubble parent = bubbles[parentIndex];
+    const SphereShape shape = sphereShape(parent,s.call.x);
+    const float4 body = systems[index].position;
+    float3 centre = bubbleWorldPoint(body.xyz*shape.axes,parent,bubbleCentre(parent,shape,s));
+    if (s.heldSystemCentre.w > 0. && s.heldSystem == index)
+        centre = mix(centre,s.heldSystemCentre.xyz,s.heldSystemCentre.w);
+    const float depth = dot(centre-s.eye.xyz,s.forward.xyz);
+    if (depth < .12) return {float4(0.,0.,-1.,1.),float2(0.),float4(0.),float3(0.),float2(0.),index,float4(0.)};
+    const float radius = parent.position.w*body.w*min(shape.axes.x,min(shape.axes.y,shape.axes.z));
+    // A minimum raster footprint keeps very distant systems stable as they pass between pixels.
+    const float footprint = max(radius,.72*depth*s.orbitalPixel);
+    const float2 quad = (patch(id,1,1)*2.-1.)*1.75;
+    const float3 clip = projectWorld(centre+footprint*(s.right.xyz*quad.x+s.up.xyz*quad.y),s);
+    const float3 tint = skies[uint(parent.bellSystem)-1u].region.xyz;
+    return {float4(clip.xy,clip.z-.12,clip.z),quad*(footprint/radius),float4(tint,parent.presence),parent.palette.rgb,
+            float2(depth,parent.flow.y),index,float4(centre,radius)};
 }
 
-float playerFlowCoverage(AnimalFragment in, float visibility) {
-    const float cover = in.state.z*smoothstep(0.,.18,visibility);
-    if (in.shape.z != 1. && in.shape.z != 2.) return cover;
-    const float across = 1.-smoothstep(.58,1.,abs(in.shape.x*2.-1.));
-    const float along = smoothstep(0.,.043,in.shape.y)*(1.-smoothstep(.89,1.,in.shape.y));
-    return cover*across*along;
+float hullTransmission(float depth, uint2 pixel, texture2d<half,access::read> hull,
+                       texture2d<half,access::read> hullRange) {
+    const float cover = hull.read(pixel).w;
+    return cover > 0. && depth*cover > float(hullRange.read(pixel).r) ? 1.-cover : 1.;
 }
 
-JellyLight paintedJelly(AnimalFragment in, constant Scene& s, float3 view, float silhouette,
-                       float visibility, float weight, float4 pocket) {
-    const float2 uv = in.shape.xy;
-    const float kind = in.shape.z;
-    const float hero = in.state.z;
-    const float facing = dot(normalize(in.normal+float3(.0001)),view);
-    const float grazing = pow(1.-saturate(abs(facing)),2.1);
-    const float facingLight = saturate(.51+.42*dot(in.normal,s.sun.xyz));
-    const float angle = uv.x*tau;
-    const bool trail = kind == 1. || kind == 2.;
-    const float2 domain = trail || kind == 4. ? uv*float2(4.2,18.4) :
-                          float2(cos(angle),sin(angle))*sin(uv.y*pi*.5)*11.5;
-    const float2 marks = paintStrokes(domain+in.state.w*17.2);
-    const float brush = smoothstep(.24,.77,marks.y);
-    const float load = saturate(.14+.53*facingLight+.31*marks.x+.19*(brush-.5));
-    const float3 slate = float3(.23,.28,.39);
-    const float3 blue = float3(.52,.67,.76);
-    const float3 chalk = mix(float3(.79,.87,.91),float3(.96,.89,.81),.25+.70*hero);
-    const float3 coral = mix(float3(.69,.34,.39),float3(.96,.49,.37),marks.x);
-    const float warm = saturate(.63*hero+.34*in.state.w+.12*(in.pigment.w > .5));
-    const float3 underpaint = mix(mix(slate,blue,marks.x),float3(.52,.34,.43),warm*.52);
-    float3 colour = mix(underpaint,chalk,load);
-    const float accent = smoothstep(.52,.82,marks.x+.17*(brush-.5))*warm;
-    float opacity;
-    float rim = 0.;
+float4 shadeSystemBubble(device const SystemBubble& system, float2 local, float width, float3 tint,
+                         float yaw, float3x3 camera, float time, constant FlightScene& ziksa, bool closeUp = false) {
+    const float radius = length(local);
+    const float soft = clamp(.47*width,closeUp ? .001 : .024,.85);
+    const float resolved = 1.-smoothstep(.36,1.14,width);
+    const float rim = resolved*smoothstep(.43,.92,radius);
+    const float2 glintOffset = local-float2(-.39,.62);
+    const float glint = resolved*exp2(-26.*dot(glintOffset,glintOffset));
+    const bool isZiksa = uint(system.catalogue.x) == 14538u;
+    const float starSize = isZiksa ? ziksa.bodies[0].position.w : system.star.w;
+    const float3 star = isZiksa ? ziksa.bodies[0].colour.xyz : system.star.xyz;
+    const float starCore = 1.-smoothstep(max(0.,starSize-soft),starSize+soft,radius);
+    const float shine = exp2(-9.*radius*radius);
+    const float3 dye = mix(tint,star,.32);
+    float3 light = dye*(.034+.48*rim) + glint*mix(dye,float3(.87,.97,1.),.75)*.66;
+    light += star*(.85*starCore+.24*shine+.29*(1.-resolved));
+    if (closeUp && starCore > 0.) {
+        const float limb = sqrt(saturate(1.-powr(radius/starSize,2.)));
+        const float2 surface = local/starSize;
+        const float granules = noise(surface*16.+float2(time*.23,limb*2.));
+        const float flows = noise(surface*6.4+float2(-time*.086,granules*.57));
+        light += star*starCore*(.16+.43*limb*(.48+.52*flows)+.25*granules);
+    }
+    float opacity = .10+.37*rim+.45*starCore+.24*shine+.25*(1.-resolved);
 
-    if (trail) {
-        const float side = 1.-abs(uv.x*2.-1.);
-        const float taper = pow(saturate(1.-uv.y),.53);
-        const float root = smoothstep(.013,.072,uv.y);
-        colour = mix(colour,coral,mix(.24,.61,brush)*warm);
-        opacity = side*taper*root*(.49+.22*brush+.08*hero);
-        rim = side*taper*.22;
-    } else if (kind == 4.) {
-        colour = mix(float3(.30,.18,.26),coral,load*.63);
-        opacity = .52+.14*brush;
-    } else {
-        const float broken = uv.y+.049*(marks.y-.5);
-        rim = smoothstep(.86,.99,broken);
-        const float dryEdge = grazing*(.29+.52*brush);
-        colour = mix(colour,coral,accent*(.49+.22*rim));
-        colour = mix(colour,chalk,max(.78*rim,dryEdge));
-        const float wash = .5+.5*sin(angle*2.+in.pigment.y+marks.x*3.1);
-        colour = mix(colour,mix(blue,chalk,wash),rim*grazing*(.15+.22*brush));
-        opacity = (kind == 3. ? .39 : .60)+.12*brush+.14*rim+.07*hero;
+    const float detail = 1.-smoothstep(.17,.37,width);
+    if (detail > 0.) {
+        // The overview uses an orthographic ray through the same scene as the cockpit.
+        const float3 right = rotateY(camera[0],-yaw), up = rotateY(camera[1],-yaw);
+        const float3 forward = rotateY(camera[2],-yaw);
+        const float3 eye = right*local.x+up*local.y-forward*2.4;
+        const float pixel = max(.0001,width*.48);
+        const float4 orbits = isZiksa ? ziksaInterior(eye,forward,0.,pixel,ziksa,false) :
+                                      catalogueInterior(system,eye,forward,0.,pixel,time);
+        light = mix(light,orbits.rgb,detail*.87*orbits.w);
+        opacity = max(opacity,orbits.w*detail*.91);
     }
 
-    if (in.lighting.x > 0.) {
-        const float relay = contractionLight(in.pigment.y,trail ? .29+.64*uv.y : .25*(1.-uv.y));
-        const float3 shadow = mix(float3(.061,.066,.099),float3(.24,.23,.33),marks.x);
-        colour = mix(shadow,chalk,saturate(rim*(.44+.52*relay)+grazing*.31));
-    }
-    if (in.lighting.z >= 0.) {
-        const float3 distanceTint = mix(float3(.69,.62,.49),blue,in.lighting.z);
-        colour = mix(colour,distanceTint,.36)*mix(.27,1.,in.lighting.y);
-        opacity *= mix(.45,1.,in.lighting.y);
-    }
-    const float3 distant = mix(float3(.046,.062,.107),blue,(rim*.62+grazing*.18)*(.57+.43*brush));
-    colour = mix(colour,distant,silhouette);
-    combineBellWindow(colour,opacity,pocket);
-    const float a = saturate(opacity)*visibility;
-    return {half4(half3(colour*(a*weight)),half(a*weight)),half2(a,playerFlowCoverage(in,visibility))};
+    return float4(light,opacity);
 }
 
-struct BellOptics { float opacity; float3 light; };
-
-BellOptics colossalOptics(AnimalFragment in, constant Scene& s, float3 view, float3 normal,
-                          float rim, float3 dye, float3 phosphor) {
-    const float2 uv = in.shape.xy;
-    const float time = s.screen.y;
-    const float angle = uv.x*tau;
-    const uint gate = uint(in.lighting.w)-1u;
-    const float4 passage = s.passages[gate];
-    const float3 offset = in.world-passage.xyz;
-    const float detailScale = clamp(18./in.scale,.042,.53);
-    const float face = dot(normal,view);
-    const float3 inward = refract(-view,face < 0. ? -normal : normal,.78);
-    const float2 shell = float2(offset.x+.24*offset.z,offset.y-.16*offset.z)*detailScale;
-    const float2 bend = float2(inward.x+.24*inward.z,inward.y-.16*inward.z);
-    const float2 pocket = shell+bend*1.26;
-    const float2 drift = shell+bend*3.83+float2(2.1,-1.6);
-    const float2 veins = refractedWater(pocket,time*.19,length(fwidth(pocket)));
-    const float2 eddies = refractedWater(drift*.59,-time*.14,length(fwidth(drift))*.59);
-    const float wash = noise(drift*.44+float2(0.,time*.021));
-    const float wave = pocket.y+.39*sin(.79*pocket.x-time*.21)+.64*wash;
-    const float surface = exp2(-2.6*(wave-.82)*(wave-.82));
-    const float waterline = exp2(-19.*(wave-.94)*(wave-.94));
-    const float trough = (1.-smoothstep(-1.6,.87,wave))*(.41+.59*wash);
-
-    const float seam = uv.x*18.+uv.y*(.22*sin(angle*6.+uv.y*7.2)+.16*sin(angle*11.-uv.y*14.));
-    const float channels = periodicLine(seam,.028)*smoothstep(.15,.73,uv.y);
-    const float fork = .18*sin(uv.y*19.+angle*5.);
-    const float branches = periodicLine(seam+fork,.024)*smoothstep(.46,.94,uv.y);
-    const float sleeve = exp2(-460.*(uv.y-.968)*(uv.y-.968));
-    const float pulse = contractionLight(in.pigment.y,.36+.53*uv.y);
-    const float filmPhase = 3.7*abs(face)+2.9*wash+.17*sin(angle*6.);
-    const float3 film = .48+.52*cos(filmPhase+float3(.08,2.32,4.01));
-    const float3 entranceLight = s.passageColours[gate].xyz;
-    const float3 enamel = mix(dye,entranceLight,.72);
-    const float3 gleam = mix(entranceLight,float3(1.,.94,.86),.29);
-    const float3 opal = mix(enamel,gleam,smoothstep(.22,.79,wash+.09*veins.x));
-    const float3 shadow = mix(dye,entranceLight,.46)*.7;
-    const float3 livingLight = mix(opal,mix(entranceLight,phosphor,.27),.17+.32*pulse);
-
-    // A sparse third layer of drifting organisms gives the flooded bell a sense of depth.
-    const float2 reef = drift*1.64+float2(time*.018,-time*.040);
-    const float seed = hash21(floor(reef));
-    const float moteSize = mix(.044,.124,seed*seed);
-    const float2 local = fract(reef)-float2(.24+.49*seed,.5);
-    const float fleck = 1.-smoothstep(moteSize*.37,moteSize,length(local*float2(.76,1.7)));
-    const float slip = local.x+.024*sin(local.y*35.+seed*42.-time);
-    const float filament = exp2(-slip*slip*3400.)*smoothstep(.005,.030,local.y)*
-                           (1.-smoothstep(.034,.15,local.y));
-    const float shoal = smoothstep(.66,.96,seed)*(.77*fleck+.36*filament)*
-                        (1.-smoothstep(.027,.16,length(fwidth(reef))))*(.24+.76*eddies.x);
-
-    const float aperture = length(offset*float3(1.,1.13,.42))/passage.w;
-    const float opening = 1.-smoothstep(.53,1.13,aperture);
-    const float shore = exp2(-66.*(aperture-.94)*(aperture-.94))*(.19+.81*veins.x);
-    const float depthLight = (.14*veins.x+.25*veins.y)*(.15+.85*surface)+.28*waterline;
-    const float3 flood = shadow*(.016+.088*trough+.11*eddies.x)+
-                         opal*(depthLight+.19*shore)+enamel*.19*eddies.y*trough;
-    const float3 skin = livingLight*(channels*(.092+.19*pulse)+branches*.068+.37*sleeve)+
-                        mix(opal,film,.26)*rim*.53;
-    const float eclipse = (gate == 0u ? in.synchrony : 0.)*(.38+.58*abs(face));
-    const float density = mix(.18+.17*wash+.12*trough+.20*rim+.14*sleeve,.985,eclipse);
-    const float opacity = density*(1.-.80*opening);
-    const float3 light = ((flood+skin+opal*shoal*.52)*(1.-.64*eclipse)+
-                          gleam*eclipse*(.35*rim+.24*channels))*(1.-.71*opening);
-    return {opacity,light};
-}
-
-JellyLight interiorCreature(AnimalFragment in, constant Scene& s, float3 view,
-                           float visibility, float weight, float distance, float4 pocket) {
-    const float2 uv = in.shape.xy;
-    const float angle = uv.x*tau;
-    const float time = s.screen.y;
-    const float phase = in.pigment.y;
-    const float species = in.pigment.w;
-    const bool bell = species > 4.5;
-    const bool tendril = in.shape.z == 1. || in.shape.z == 2.;
-    const float3 facing = normalize(in.normal+float3(.0001));
-    const float rim = pow(1.-saturate(abs(dot(facing,view))),2.35);
-    const float3 base = pigment(in.pigment.x);
-    const float3 light = mix(base,s.bright.xyz,bell ? .42 : .28);
-    const float3 glint = mix(light,s.sunlight.xyz,.27);
-    float opacity;
-    float3 glow;
-    if (tendril) {
-        const float edge = 1.-abs(uv.x*2.-1.);
-        const float taper = edge*pow(saturate(1.-uv.y),.7)*smoothstep(0.,.053,uv.y);
-        const float droplets = contractionLight(phase,.12+.64*uv.y+.13*in.shape.w);
-        const float strands = periodicLine(uv.x*4.+.16*sin(20.*uv.y-phase),.064);
-        opacity = taper*(.25+.20*strands)*(bell ? .61 : 1.);
-        glow = taper*(light*(.16+.37*strands)+glint*rim*.36+droplets*glint*.28);
-    } else if (bell && in.lighting.w > 0. && in.lighting.w < float(bellPassageCount) && in.shape.z != 4.) {
-        const BellOptics optics = colossalOptics(in,s,view,facing,rim,base,light);
-        const bool underside = in.shape.z == 3.;
-        opacity = optics.opacity*(underside ? .66 : 1.);
-        glow = optics.light*(underside ? .72 : 1.);
-    } else if (bell) {
-        const float2 radial = float2(cos(angle),sin(angle));
-        float2 liquid = radial*(.48+3.9*uv.y);
-        liquid += .36*view.xy;
-        const float wash = fbm(liquid*2.15+float2(.017*time,-.010*time));
-        const float surface = .49+.12*sin(liquid.x*1.25+time*.085)+.091*wash;
-        const float tide = liquid.y*.17+.45-surface;
-        const float horizon = exp(-abs(tide)*31.);
-        const float refraction = exp(-abs(sin(tide*32.+wash*5.4+time*.36))*5.);
-        const float sleeve = exp2(-390.*(uv.y-.963)*(uv.y-.963));
-        const float seams = periodicLine(uv.x*18.+.12*sin(19.*uv.y-phase),.047);
-        const float2 address = liquid*3.4+float2(0.,time*.11);
-        const float2 cell = floor(address);
-        const float seed = hash21(cell);
-        const float2 local = fract(address)-float2(.30+.39*seed,.52);
-        const float young = 1.-smoothstep(.10,.21,length(local*float2(1.,1.7)));
-        const float stems = exp(-abs(local.x+.05*sin(local.y*24.+phase))*32.)*
-                            smoothstep(.02,.07,local.y)*(1.-smoothstep(.12,.37,local.y));
-        const float shoal = smoothstep(.35,.80,seed)*(young+stems*.47)*(1.-smoothstep(.12,.31,length(fwidth(address))));
-        float hole = 0.;
-        if (in.lighting.w > 0.) {
-            const float4 passage = s.passages[uint(in.lighting.w)-1u];
-            const float3 reach = (in.world-passage.xyz)*float3(1.,1.13,.42);
-            hole = 1.-smoothstep(.58,1.1,length(reach)/passage.w);
-        }
-        opacity = (.16+.16*wash+.18*rim+.14*sleeve)*(1.-.74*hole);
-        const float3 sea = mix(base,light,.24+.58*wash);
-        const float3 tinyLife = mix(float3(.096,.84,.69),float3(1.,.61,.22),smoothstep(.53,.89,seed));
-        glow = sea*(.055+.15*refraction+.40*horizon)+light*(.34*rim+.34*sleeve+.12*seams)+tinyLife*shoal*.64;
-        glow *= 1.-.47*hole;
-        if (in.shape.z == 4.) { opacity *= .57; glow *= .43; }
-    } else {
-        const bool lantern = species > 3.5;
-        const float seams = periodicLine(uv.x*bellLobes(species)+.14*sin(uv.y*12.+phase),.063);
-        const float rings = periodicLine(uv.y*(lantern ? 7. : 4.)-.15*sin(phase+2.*angle),.072);
-        const float pulse = contractionLight(phase,.2+.53*uv.y);
-        const float enamel = exp2(-74.*(uv.y-.90)*(uv.y-.90));
-        opacity = .13+.23*rim+.21*seams+.09*rings;
-        glow = base*(.14+.26*seams)+light*(.26*rim+.22*rings+.31*enamel)+
-               glint*pulse*(lantern ? .66*rings : .48*seams);
+fragment BubbleLight systemBubbleLight(SystemBubbleFragment in [[stage_in]], constant Scene& s [[buffer(0)]],
+                                      device const SystemBubble* systems [[buffer(3)]],
+                                      device const float* colours [[buffer(7)]],
+                                      constant FlightScene& ziksa [[buffer(2)]],
+                                      texture2d<half,access::read> hull [[texture(3)]],
+                                      texture2d<half,access::read> hullRange [[texture(4)]]) {
+    const float radius = length(in.local);
+    const float width = max(length(fwidth(in.local)),.0001);
+    const float soft = clamp(.47*width,.024,.85);
+    const float silhouette = 1.-smoothstep(1.-soft,1.+soft,radius);
+    if (silhouette <= 0.) return {half4(0.),half2(0.)};
+    device const SystemBubble& system = systems[in.system];
+    const float depth = in.depthAndYaw.x;
+    const float transmission = hullTransmission(depth,uint2(in.position.xy),hull,hullRange);
+    if (transmission <= 0.) return {half4(0.),half2(0.)};
+    const float3x3 camera(s.right.xyz,s.up.xyz,s.forward.xyz);
+    float4 pocket = shadeSystemBubble(system,in.local,width,in.tint.xyz,in.depthAndYaw.y,camera,s.celestialTime,ziksa);
+    if (s.searchlightOrigin.w > 0.) {
+        const float3 normal = camera*float3(in.local,-sqrt(saturate(1.-radius*radius)));
+        const float reflection = searchlightFilm(in.sphere.xyz+normal*in.sphere.w,normal,s);
+        pocket.rgb += searchlightColour*(2.1*reflection);
+        pocket.w += .18*reflection;
     }
-    combineBellWindow(glow,opacity,pocket);
-    const float distanceScale = in.lighting.w > 0. ? max(1.,in.scale/40.) : 1.;
-    const float fog = exp(-(distance/distanceScale)*(bell ? .0046 : .014));
-    const float a = opacity*visibility*fog;
-    const float3 colour = mix(glow,s.deep.xyz*.22,1.-fog);
-    return {half4(half3(colour*visibility*fog*weight),half(a*weight)),half2(a,0.)};
+    const float coverage = transmission*silhouette*in.tint.w*smoothstep(.15,2.7,depth)*
+        (1.-smoothstep(72.,107.,depth))*exp(-.0057*depth);
+    const float weight = .048+1.7*exp2(-.091*depth);
+    const float a = saturate(pocket.w)*coverage;
+    const float colour = bubbleColourAt(colours[uint(system.catalogue.x)],s.celestialTime);
+    return {half4(half3(bubbleChroma(pocket.xyz,float4(in.lockedTint,colour))*coverage*weight),half(a*weight)),
+            half2(a,0.)};
 }
 
-fragment JellyLight jellyMembrane(AnimalFragment in [[stage_in]], constant Scene& s [[buffer(0)]],
-                                  constant BellSystem* systems [[buffer(1)]],
-                                  texture2d<half> waterLight [[texture(0)]]) {
+fragment half4 systemSurveyLight(Full in [[stage_in]], constant float4& frame [[buffer(0)]],
+                                constant float4& tintAndTime [[buffer(1)]],
+                                device const SystemBubble* systems [[buffer(2)]],
+                                constant uint& index [[buffer(3)]],
+                                constant FlightScene& ziksa [[buffer(4)]],
+                                constant float4& palette [[buffer(5)]]) {
+    const float2 local = (in.uv-frame.xy)*float2(frame.w,-1.)/frame.z;
+    const float r = length(local);
+    const float width = max(length(fwidth(local)),.001);
+    const float3 tint = tintAndTime.xyz;
+    const float3 surround = bubbleChroma(float3(.006,.014,.018)+tint*(.015*exp2(-1.34*r*r)),palette);
+    const float shell = 1.-smoothstep(1.-width,1.+width,r);
+    if (shell <= 0.) return half4(half3(surround),1.);
+
+    const float yaw = .11+.18*sin(tintAndTime.w*.12);
+    const float3 forward = normalize(float3(.10,.94,.52));
+    const float3 right = normalize(cross(float3(0.,1.,0.),forward));
+    const float3 up = cross(forward,right);
+    const float3x3 camera(right,up,forward);
+    device const SystemBubble& system = systems[index];
+    const float4 pocket = shadeSystemBubble(system,local,width,tint,yaw,camera,tintAndTime.w,ziksa,true);
+
+    // Project the same plane the planets move in, then draw its orbital lanes.
+    const float3 x = rotateY(float3(1.,0.,0.),yaw), y = rotateY(float3(0.,.43,.903),yaw);
+    const float2 axisX = float2(dot(x,right),dot(x,up));
+    const float2 axisY = float2(dot(y,right),dot(y,up));
+    const float area = axisX.x*axisY.y-axisX.y*axisY.x;
+    const float planeRadius = length(float2(axisY.y*local.x-axisY.x*local.y,
+                                            -axisX.y*local.x+axisX.x*local.y)/area);
+    float lane = 2.;
+    for (uint body = 0u; body < systemPlanetLimit; ++body) {
+        const float4 orbit = system.orbits[body];
+        if (orbit.w <= 0.) break;
+        lane = min(lane,abs(planeRadius-orbit.x));
+    }
+    const float rings = (uint(system.catalogue.x) == 14538u ? 0. : 1.-smoothstep(width*.48,width*1.6,lane))*smoothstep(system.star.w,system.star.w+.01,r);
+    const float film = smoothstep(.73,1.,r);
+    const float fineRim = exp2(-abs(r-.974)*55.);
+    const float3 glass = mix(tint,float3(.49,.84,.89),film*.50);
+    const float3 colour = surround+shell*bubbleChroma(pocket.xyz*.73+glass*(.10*film+.39*fineRim)+
+                                         mix(tint,float3(.47,.63,.66),.56)*rings*.23,palette);
+    return half4(half3(colour/(1.+.37*colour)),1.);
+}
+
+fragment BubbleLight bubbleMembrane(BubbleFragment in [[stage_in]], constant Scene& s [[buffer(0)]],
+                                    constant BellSystem* systems [[buffer(1)]],
+                                    constant FlightScene& flight [[buffer(2)]],
+                                    device const SystemBubble* catalogues [[buffer(5)]],
+                                    texture2d<half> waterLight [[texture(0)]],
+                                    texture2d<half,access::read> hull [[texture(3)]],
+                                    texture2d<half,access::read> hullRange [[texture(4)]]) {
     constexpr sampler sampleWater(coord::normalized,address::clamp_to_edge,filter::linear);
     const float3 offset = s.eye.xyz-in.world;
-    const float distance = length(offset);
-    const float3 view = offset/max(.0001,distance);
-    if (in.state.z <= 0. && s.enclosingBell.w > 0. && in.scale == s.enclosingBell.w) {
-        const float2 uv = saturate(in.shape.xy);
-        const float edge = 1.-abs(uv.x*2.-1.);
-        const float taper = smoothstep(.01,.12,uv.y)*(1.-smoothstep(.78,1.,uv.y));
-        const float phase = uv.x*3.+.15*sin(uv.y*23.-in.pigment.y);
-        const float strandDetail = 1.-smoothstep(.12,.51,fwidth(phase));
-        const float ribs = .44+.44*cos(phase*tau)*strandDetail;
-        const float pulse = contractionLight(in.pigment.y,.13+.64*uv.y+.11*in.shape.w);
-        const float3 tint = mix(float3(.18,.81,.71),float3(.97,.31,.47),smoothstep(.23,.83,in.shape.w));
-        const float presence = in.presence*(1.-smoothstep(5.4,8.2,distance/in.scale));
-        const float opacity = presence*taper*edge*(.25+.33*ribs);
-        const float surge = s.cycle.y > .36 ? exp2(-42.*powr(abs(uv.y-(s.cycle.y-.36)*2.2),2.))*
-            (1.-smoothstep(.78,.94,s.cycle.y)) : 0.;
-        const float3 lit = tint*(.24+.49*ribs+.51*pulse)+s.sunlight.xyz*(.083+.13*pulse)+
-                           mix(tint,float3(.65,.91,1.),.50)*(1.4*surge*ribs);
-        return {half4(half3(lit*opacity),half(opacity)),half2(opacity,0.)};
-    }
-    const float largest = smoothstep(9.,13.,in.scale);
-    const float morphScale = s.cycle.y > 0. && in.state.z > 0. ? max(1.,in.scale/1.25) : 1.;
-    const float silhouette = largest*smoothstep(43.,126.,distance/morphScale);
-    const float depth = exp(-distance/morphScale*mix(.015,.0076,silhouette));
+    const float distance = length(offset), size = in.presenceAndSize.y;
     const float nearPlane = -dot(offset,s.forward.xyz);
-    const float distanceScale = in.lighting.w > 0. ? max(1.,in.scale/40.) : morphScale;
-    const float hero = in.state.z;
-    const float visibility = in.presence*smoothstep(.24,2.7,nearPlane)*
-                             (1.-smoothstep(mix(71.,148.,largest),mix(107.,224.,largest),distance/distanceScale));
+    const float hullClearance = hullTransmission(nearPlane,uint2(in.p.xy),hull,hullRange);
+    const float largest = smoothstep(9.,13.,size);
+    const bool passage = in.lighting.w > 0.;
+    const bool player = in.state.z > 0.;
+    const float distanceScale = passage ? max(1.,size/40.) : player && s.cycle.y > 0. ? max(1.,size/1.25) : 1.;
+    const float reach = distance/distanceScale;
+    const float visibility = hullClearance*in.presenceAndSize.x*smoothstep(.24,2.7,nearPlane)*
+        (1.-smoothstep(mix(71.,148.,largest),mix(107.,224.,largest),reach));
     if (visibility <= 0.) return {half4(0.),half2(0.)};
-    const float weight = .048+1.7*exp2(-.091*max(0.,nearPlane));
-    const float3 bellNormal = normalize(in.normal+float3(.0001));
-    const float4 pocket = bellWindow(in,s,systems,view,bellNormal);
-    const float3 column = mix(depthLight(in.world.y,s),float3(1.),.36*hero);
-    if (in.pigment.w > 2.5 || s.graphicsStyle == paintedGraphics) {
-        JellyLight result = in.pigment.w > 2.5 ? interiorCreature(in,s,view,visibility,weight,distance,pocket) :
-                            paintedJelly(in,s,view,silhouette,depth*visibility,weight,pocket);
-        result.weighted.rgb *= half3(column);
-        return result;
-    }
-    const float2 uv = in.shape.xy;
-    const float clock = s.screen.y;
-    const float currentContrast = hero*s.habitat.w;
-    const float kind = in.pigment.w;
-    const float rz = uv.y;
-    const float angle = uv.x*tau;
-    const float hueSeed = in.pigment.x+.022*sin(clock*.076+in.state.w*tau);
-    const float hue = hueSeed+.065*cos(angle+rz*3.2);
-    const float3 prism = pigment(hue);
-    const float basinTone = in.lighting.z;
-    const float eclipsing = in.lighting.x;
-    const float3 bellDye = paletteColour(s.paletteMix,playerBody);
-    const float3 rimDye = paletteColour(s.paletteMix,playerRim);
-    float3 dye = mix(prism,bellDye,hero);
-    float3 flare = mix(pigment(hue+.12),rimDye,hero);
-    if (basinTone >= 0.) {
-        const float3 gold = float3(.93,1.,.012);
-        const float3 turquoise = float3(.009,1.,.62);
-        const float3 blue = float3(.022,.24,1.);
-        const float3 lantern = mix(mix(gold,turquoise,smoothstep(.16,.59,basinTone)),blue,
-                                   smoothstep(.52,.96,basinTone));
-        dye = mix(dye,lantern,.74);
-        flare = mix(flare,lantern,.84);
-    }
-    const float beat = pow(saturate(.5+.5*sin(in.pigment.y)),3.)*in.synchrony;
-    const float pulse = 1.+1.03*in.pigment.z+.59*beat+.64*s.call.x*hero;
-    const float shimmer = pow(saturate(.5+.5*sin(angle*13.+rz*42.-clock*4.4)),4.);
-    const float3 phosphor = mix(flare,s.bright.xyz,beat*.46)*pulse*
-                           (1.+s.music.z*(.16+.55*shimmer)+.20*s.music.w);
-    const float3 normal = bellNormal;
-    const float ndv = dot(normal,view);
-    const float facing = smoothstep(-.18,.18,ndv);
-    const float edge = 1.-saturate(abs(ndv));
-    const float fresnel = pow(edge,3.8);
-    const float3 sun = normalize(s.sun.xyz);
-    const float3 halfVector = normalize(view+sun+float3(.00011,.00007,.00013));
-    const float shine = abs(dot(normal,halfVector));
-    const float sunAngle = dot(normal,sun)*(2.*facing-1.);
-    const float morning = saturate(sunAngle*.54+.45);
-    const float backlight = saturate(-sunAngle*.72+.37);
-    const float3 sheen = mix(s.sunlight.xyz,float3(.21,.62,1.),.32);
-    const float3 eclipseTint = mix(s.sunlight.xyz,float3(.08,.70,1.),.67);
-    float3 radiance;
-    float opacity;
 
-    if (in.shape.z == 1. || in.shape.z == 2.) {
-        const float side = 1.-abs(uv.x*2.-1.);
-        const float x = (uv.x-.5)*6.;
-        const float silk = exp(-x*x);
-        const float tap = pow(saturate(1.-rz),.43);
-        const float flow = rz*10.-clock*.77+in.shape.w*4.67;
-        const float pearls = pow(saturate(.5+.5*sin(flow*tau)),8.);
-        const float threadline = periodicLine(uv.x*4.+.19*sin(uv.y*40.+flow),.045);
-        const float joint = 1.-smoothstep(.028,in.shape.z == 1. ? .235 : .13,rz);
-        const float sharedHue = hueSeed+.065*cos(in.attachment.x+in.attachment.y*3.2);
-        const float3 sharedDye = mix(pigment(sharedHue),bellDye,hero);
-        const float3 sharedLight = mix(pigment(sharedHue+.12),rimDye,hero)*pulse;
-        if (in.shape.z == 1.) {
-            const float pleat = rz*11.4+in.shape.w*12.+1.35*abs(x*.18)+.19*sin(rz*49.);
-            const float ridges = periodicLine(pleat,.085);
-            const float fibre = periodicLine(uv.x*8.+.18*sin(rz*34.+uv.x*6.),.028);
-            const float edgeBinding = exp(-pow((abs(x)-2.38)*3.3,2.));
-            const float centre = exp(-x*x*12.);
-            const float3 iris = pigment(hue+.105+.12*sin(pleat*tau)*fresnel);
-            const float3 lit = mix(dye,iris,.16+.35*morning);
-            const float foldShadow = smoothstep(.24,.74,.50+.50*sin(pleat*tau))*(.32+.68*silk);
-            const float nacre = pow(saturate(shine-.11*foldShadow),13.);
-            opacity = tap*(side*(.29+.26*silk+.13*ridges+.12*foldShadow)+edgeBinding*.21);
-            radiance = lit*opacity*(.071+.22*morning+.21*backlight)*(1.-.37*foldShadow) +
-                       phosphor*tap*(side*(.11+.21*fibre+.24*ridges)+
-                                     centre*(.16+.36*pearls)+edgeBinding*(.21+.15*ridges)) +
-                       mix(sheen,iris,.41)*opacity*(.18*nacre+.17*pow(shine,33.)+.072*ridges*backlight);
-            const float stem = side*(.12+.15*fibre)+centre*.15;
-            const float joinedOpacity = side*(.28+.26*silk+.06*fibre);
-            const float3 joinedLight = sharedDye*joinedOpacity*(.14+.27*morning)+
-                                       sharedLight*stem+sheen*pow(shine,25.)*side*.075;
-            opacity = mix(opacity,joinedOpacity,joint);
-            radiance = mix(radiance,joinedLight,joint);
-        } else {
-            const float lumen = exp(-x*x*5.5);
-            const float knot = pearls*(.52+.48*sin(rz*9.5+in.shape.w*18.));
-            const float3 filament = mix(phosphor,pigment(hue+.17),.25+.17*sin(flow));
-            opacity = side*tap*(.23+.28*lumen+.22*knot);
-            radiance = dye*opacity*.20+filament*tap*side*(.08+.30*threadline+.64*knot*lumen)+
-                       sheen*silk*pow(shine,27.)*tap*.14;
-            const float heel = side*(.18+.28*lumen+.09*fresnel);
-            const float3 collarLight = heel*(sharedDye*(.22+.30*morning)+sharedLight*(.22+.34*lumen));
-            opacity = mix(opacity,heel,joint);
-            radiance = mix(radiance,collarLight,joint);
-        }
-        const float trim = currentContrast*tap*side;
-        const float travellingLight = contractionLight(in.pigment.y,.20+.64*rz);
-        const float3 ribbonLight = mix(sharedLight,sheen,.28+.24*backlight);
-        radiance += ribbonLight*travellingLight*tap*side*silk*(1.-joint)*(.11+.14*hero);
-        opacity += trim*(.065+.060*silk);
-        radiance += sharedLight*trim*(.088+.055*joint);
-        if (eclipsing > 0.) {
-            const float relay = contractionLight(in.pigment.y,.29+.64*rz);
-            const float stem = silk*side*(.25+.75*joint);
-            radiance = radiance*.23+eclipseTint*(relay*.94+.11*backlight)*stem*tap;
-        }
-        // The first rows sit within the bell and pick up their opacity as they emerge.
-        const float emergence = mix(.06,1.,smoothstep(0.,in.shape.z == 1. ? .044 : .037,rz));
-        opacity *= emergence;
-        radiance *= emergence;
-    } else if (in.shape.z == 4.) {
-        const float folds = periodicLine(uv.x*19.+.23*sin(rz*tau+angle*3.),.067);
-        const float inner = smoothstep(.07,.74,sin(rz*tau));
-        const float flow = pow(saturate(.5+.5*sin(angle*2.-clock*1.36+in.shape.w*tau)),5.);
-        const float3 warm = mix(phosphor,float3(1.,.20,.038)*pulse,.17+.18*hero);
-        const float3 tissue = mix(dye*.65,warm,.39+.13*inner);
-        const float3 tissueEdge = mix(warm,sheen,.40);
-        opacity = mix(.35,.63,facing)+.12*fresnel+.07*folds;
-        radiance = tissue*opacity*(.075+.35*morning+.18*inner) +
-                   warm*(.041+.23*folds+.31*flow*inner)*opacity+
-                   tissueEdge*fresnel*(.035+.13*folds)*opacity+
-                   sheen*(pow(shine,42.)*.17+pow(shine,8.)*.027);
-        if (eclipsing > 0.) radiance *= .24;
-    } else {
-        const bool underside = in.shape.z == 3.;
-        const bool comb = kind >= 1.5;
-        const float count = bellLobes(kind);
-        const float warp = rz*(.25*sin(angle*3.+rz*5.6)+.11*sin(angle*5.-rz*18.+in.state.w*4.));
-        const float canals = uv.x*count+warp;
-        const float fork = .35*sin(rz*11.+angle*3.)*smoothstep(.30,.69,rz);
-        const float primary = periodicLine(canals,.027+.018*rz)*smoothstep(.12,.49,rz);
-        const float vein = (periodicLine(canals+fork,.016)+periodicLine(canals-fork,.016))*
-                           smoothstep(.44,.83,rz)*.5;
-        const float filaments = periodicLine(canals*3.+.12*sin(rz*42.+angle*5.),.024)*
-                                (.18+.82*pow(saturate(.5+.5*cos(canals*tau)),2.));
-        const float lip = smoothstep(.72,.98,rz);
-        const float rim = exp(-pow((rz-.983)*39.,2.));
-        const float rimThreads = periodicLine(rz*16.4+.15*cos(canals*tau),.032)*lip;
-        const float2 tissueUV = float2(cos(angle),sin(angle))*(.49+rz*5.8);
-        const float texture = fbm(tissueUV*1.7+float2(rz*13.,in.state.w*9.));
-        const float micro = noise(tissueUV*8.6+in.state.w*4.4);
-        const float granules = smoothstep(.70,.89,micro)*(1.-smoothstep(.06,.37,length(fwidth(tissueUV))));
-        const float travel = pow(saturate(.5+.5*sin(rz*22.-clock*2.13+warp*3.)),3.);
-        const float cilia = periodicLine(canals,.062)*(.34+.66*travel)*
-                           (.22+.78*periodicLine(rz*12.5-clock*.68,.12));
-        const float thickness = .59+.41*texture-.28*rz*rz;
-        const float spectrum = .52+.27*cos(13.*edge+rz*7.+4.*texture)+.18*sin(18.*edge-rz*9.);
-        float3 film = pigment(hue+.045+.36*spectrum);
-        const float opticalPath = (1.7+3.1*thickness)*sqrt(max(0.,1.-.48*edge*edge))+.55*texture;
-        const float3 interference = .54+.46*cos(opticalPath*float3(1.38,1.68,2.04)+hue*4.2);
-        film = mix(film,film*(.38+.62*interference)+interference*.24,.28+.29*fresnel);
-        if (hybridWater(s)) {
-            const float swirl = angle*2.+rz*7.4+1.45*texture-clock*.23+hueSeed*5.1;
-            film = mix(film,hybridPrism(swirl),.27+.27*fresnel);
-        }
-        const float3 gel = mix(dye*.76,mix(float3(.053,.15,.54),s.water.xyz,.37),.08+.29*texture);
-        const float3 iridescence = mix(film,phosphor,.37+.18*clamp(hero,0.,1.));
-        const float3 shellLight = mix(sheen*.91,iridescence,.38+.39*fresnel);
-        const float structure = (comb ? .24*cilia : (.124+.064*travel)*primary) +
-                                vein*.093+filaments*.037;
-        opacity = (underside ? .061+.13*fresnel+.086*rim :
-                              .062+.20*thickness*(.50+.50*facing)+.20*fresnel+.081*rim);
-        opacity *= mix(.53,1.,facing);
-        opacity += .11*structure;
-        const float backScatter = .27*backlight*(.32+.68*texture);
-        const float volume = .10+.13*texture+.24*morning+backScatter;
-        const float wetness = .73+.27*noise(tissueUV*4.1+float2(texture,in.state.w*9.));
-        const float polished = pow(shine,55.)*(.20+.32*wetness)+pow(shine,13.)*.071;
-        const float bellRim = rim*(.20+.086*travel+.071*texture)+.095*rimThreads;
-        const float pearlBand = exp2(-1350.*(rz-.952)*(rz-.952));
-        const float pearls = periodicLine(uv.x*count*3.+.13*sin(angle*3.+rz*7.),.103)*pearlBand;
-        const float arc = contractionLight(in.pigment.y,.16+.25*cos(angle*2.));
-        const float3 pearlTint = mix(iridescence,sheen,.27+.26*morning);
-        const float3 innerGlow = mix(gel,s.sunlight.xyz,.28)*backlight*(.045+.12*thickness)*opacity;
-        const float3 lipLight = mix(film,sheen,.53)*(.17+.21*morning)*
-                                rim*(.33+.67*pow(shine,5.));
-        radiance = gel*opacity*volume +
-                   (phosphor*structure+iridescence*(bellRim+fresnel*(.088+.11*texture)))*
-                        mix(.56,1.,facing) +
-                   shellLight*(polished+granules*(.008+.066*pow(shine,13.))) + innerGlow+lipLight +
-                   pearlTint*pearls*(.085+.14*arc+.11*hero)*(.36+.64*facing);
-        if (underside) {
-            const float radial = sin(rz*pi*.5);
-            const float oralWeb = smoothstep(.03,.22,radial)*(1.-smoothstep(.35,.53,radial));
-            const float margin = smoothstep(.69,.84,radial)*(1.-smoothstep(.955,.996,radial));
-            const float ribs = periodicLine(uv.x*count+in.state.w,.066);
-            const float mesh = oralWeb*(.45+.55*texture)+margin*(.37+.63*ribs);
-            opacity += .088*mesh;
-            radiance += (dye*(.08+.13*morning)+phosphor*(.050+.13*ribs))*mesh;
-        }
-        if (eclipsing > 0.) {
-            const float relay = contractionLight(in.pigment.y,.25*(1.-rz));
-            const float transmission = rim*(.29+.36*morning)+
-                                       fresnel*(.07+.62*backlight)*mix(.62,1.,lip);
-            const float path = primary*.62+vein*.29+rim*.73;
-            radiance = radiance*.18+eclipseTint*(transmission+path*relay*1.06);
-            opacity = max(opacity,.48+.15*(1.-fresnel));
-        }
-        // In fast water, let the player's pigment hold against the bright cyan behind the bell.
-        const float tintedGel = currentContrast*(.103+.053*fresnel+.048*rim);
-        opacity += tintedGel;
-        radiance += dye*(tintedGel*.24)+flare*currentContrast*(.095*rim+.046*primary+.075*fresnel);
-        if (silhouette > 0.) {
-            const float3 ink = mix(s.deep.xyz,float3(.013,.039,.106),.67);
-            const float3 farRim = mix(float3(.035,.20,.55),s.bright.xyz,.16);
-            const float shell = .39+.15*fresnel+.072*rim;
-            opacity = mix(opacity,max(opacity,shell),silhouette);
-            radiance = mix(radiance,ink*(.42*opacity)+farRim*(.21*rim+.12*fresnel+.050*primary),
-                           silhouette);
-        }
-        if (ndv > 0. && visibility > .001 && silhouette < 1.) {
-            const float2 screenSize = float2(waterLight.get_width(),waterLight.get_height());
-            const float2 screenUV = in.p.xy/screenSize;
-            const float2 surfaceRipple = float2(texture-.5,micro-.5)*.18;
-            const float2 bend = (float2(dot(normal,s.right.xyz),-dot(normal,s.up.xyz))+surfaceRipple)/
-                                  float2(s.screen.x,1.)
-                              * min(.64,in.scale/max(2.,distance))*(underside ? .094 : .162)
-                              * (.67+.60*texture)*(.54+.46*ndv);
-            const float spread = .085+.19*lip+.15*edge;
-            const float3 lens = float3(waterLight.sample(sampleWater,screenUV+bend*(1.+spread)).r,
-                                      waterLight.sample(sampleWater,screenUV+bend).g,
-                                      waterLight.sample(sampleWater,screenUV+bend*(1.-spread)).b);
-            const float transparency = (.11+.18*edge)*(1.-opacity)*smoothstep(0.,.26,ndv)*
-                                       (1.-.78*eclipsing)*(1.-.36*currentContrast)*(1.-silhouette);
-            const float3 absorption = exp2(-thickness*(1.-mix(dye,film,.25))*(1.39+.57*edge));
-            radiance += lens*absorption*transparency;
-            opacity += transparency;
-        }
+    const float3 normal = normalize(in.normal+float3(.00001));
+    const float3 view = offset/max(distance,.0001);
+    const float face = dot(normal,view);
+    const float3 eye = bubbleSpace((s.eye.xyz-in.cosmos.xyz)/size,in);
+    const float inside = 1.-smoothstep(.87,1.12,length(eye));
+    const float surface = mix(.13+.87*smoothstep(-.035,.17,face),
+                              .16+.84*(1.-smoothstep(-.15,.03,face)),inside);
+    const float3 bodyDye = paletteColour(s.paletteMix,playerBody);
+    const float3 rimDye = paletteColour(s.paletteMix,playerRim);
+    float3 dye = player ? mix(bodyDye,rimDye,.42) : in.state.z < 0. ? float3(.94,.43,.085) :
+                                                                 pigment(in.pigment.x);
+    if (passage) dye = mix(dye,s.passageColours[uint(in.lighting.w)-1u].xyz,.69);
+    if (!player && in.cosmos.w > 0.) {
+        const float4 region = systems[uint(in.cosmos.w)-1u].region;
+        if (region.w > 0.) dye = mix(dye,region.xyz,.73);
     }
-    combineBellWindow(radiance,opacity,pocket);
-    if (basinTone >= 0.) {
-        radiance *= mix(.10,1.31-.12*basinTone,in.lighting.y);
-    } else {
-        radiance *= mix(1.,.50+.28*hero+.45*eclipsing,s.habitat.y);
+    const float time = s.screen.y;
+    const BubbleFilm film = bubbleFilm(normal,view,s.sun.xyz,dye,time+13.*in.state.w);
+    const float edge = film.edge;
+    const float eclipse = in.lighting.x;
+    const float painted = s.graphicsStyle == paintedGraphics ? .72 : 1.;
+    float opacity = (.024+.038*film.body+.43*edge+.24*eclipse)*(player ? 1.14 : 1.);
+    const float relay = 1.+.86*in.pigment.z+.36*s.music.w;
+    float3 light = film.colour*relay*(.027+.063*film.body+.59*edge) +
+                   mix(film.colour,s.sunlight.xyz,.62)*film.gloss*.66;
+    float clear = 1.;
+    if (passage) {
+        const float4 gate = s.passages[uint(in.lighting.w)-1u];
+        const float aperture = length((in.world-gate.xyz)*float3(1.,1.13,.42))/gate.w;
+        clear = smoothstep(.40,1.24,aperture);
+        const float lip = exp2(-54.*(aperture-.99)*(aperture-.99));
+        light += dye*lip*.29;
     }
-    const float deepWater = 1.-exp(-max(0.,distance-12.)*.016);
-    const float3 attenuation = mix(float3(1),.50+.50*s.water.xyz,.69*deepWater);
-    const float3 waterScatter = mix(s.deep.xyz,s.water.xyz*.19,.69)*opacity*deepWater*.59;
-    // Depth weighting favours the foreground smoothly, without changing draw order at crossings.
-    const float pixelOpacity = opacity*depth*visibility;
-    return {half4(half3((radiance*depth*attenuation+waterScatter)*column*visibility*weight),
-                  half(pixelOpacity*weight)),half2(pixelOpacity,playerFlowCoverage(in,depth*visibility))};
+    if (face > .01) {
+        const float2 screenUV = in.p.xy/float2(waterLight.get_width(),waterLight.get_height());
+        const float2 direction = float2(dot(normal,s.right.xyz),-dot(normal,s.up.xyz))/float2(s.screen.x,1.);
+        const float2 bend = direction*min(.47,size/max(2.,distance))*(.047+.027*film.body);
+        const float3 lens = float3(waterLight.sample(sampleWater,screenUV+bend*1.19).r,
+                                  waterLight.sample(sampleWater,screenUV+bend).g,
+                                  waterLight.sample(sampleWater,screenUV+bend*.82).b);
+        const float transmission = (.064+.088*edge)*smoothstep(.01,.28,face)*(1.-.68*eclipse)*painted;
+        light += lens*transmission*(.82+.18*dye);
+        opacity += transmission;
+    }
+    const float cohort = in.lighting.z < 0. ? 1. : mix(.36,1.,in.lighting.y);
+    const float fog = exp(-.0057*reach);
+    const float4 pocket = bubbleWindow(in,s,systems,view,eye,inside,face,flight,catalogues);
+    light *= surface*cohort*(.18+.82*clear)*painted;
+    opacity *= surface*cohort*(.19+.81*clear)*painted;
+    light = player ? light*(1.-pocket.w*.81)+pocket.rgb :
+                     mix(light,pocket.rgb*.83,pocket.w*.87)+pocket.rgb*.20;
+    opacity = max(opacity,pocket.w*.72);
+    const float reflection = searchlightFilm(in.world,normal,s)*surface*clear;
+    light += searchlightColour*reflection*(1.7+1.2*film.body+.7*film.gloss);
+    opacity += .18*reflection;
+    const float coverage = visibility*fog;
+    const float a = opacity*coverage;
+    const float weight = .048+1.7*exp2(-.091*max(0.,nearPlane));
+    float3 radiance = bubbleChroma(light,in.palette);
+    if (passage && uint(in.lighting.w) == s.openPassage && face > 0.)
+        radiance += emissiveLayerColour(in.palette.rgb)*(.018+.27*edge*edge)*painted;
+    return {half4(half3(radiance*coverage*weight),half(a*weight)),
+            half2(a,player ? coverage*smoothstep(.02,.25,opacity) : 0.)};
 }
 
 fragment half4 copyWaterLight(Full in [[stage_in]],
@@ -2357,7 +1950,12 @@ fragment half4 copyWaterLight(Full in [[stage_in]],
     return water.read(uint2(in.p.xy));
 }
 
-fragment half4 combineJellyLight(Full in [[stage_in]],
+fragment half4 copyShipLight(Full in [[stage_in]],
+                             texture2d<half,access::read> hull [[texture(3)]]) {
+    return hull.read(uint2(in.p.xy));
+}
+
+fragment half4 combineBubbleLight(Full in [[stage_in]],
                                 texture2d<half,access::read> jelly [[texture(1)]],
                                 texture2d<half,access::read> transmission [[texture(2)]]) {
     const uint2 pixel = uint2(in.p.xy);
@@ -2437,7 +2035,7 @@ vertex Fleck bloomVertex(uint id [[vertex_id]], constant Scene& s [[buffer(0)]],
         tail = s.enclosingBell.xyz+radius*colossusBloomPoint(max(0.,age-.021-.044*shimmer),layer,stream,seed,scatter);
         size = radius*(.0048+.017*shimmer);
         // The bell damps the particles behind it while leaving a glow through its membrane.
-        const float3 axes = float3(s.enclosingShape.x,.68,s.enclosingShape.x);
+        const float3 axes = s.enclosingShape.xyz;
         const float3 eye = (s.eye.xyz-s.enclosingBell.xyz)/(radius*axes);
         const float3 sight = local/axes-eye;
         const float offset = saturate(-dot(eye,sight)/max(.00001,dot(sight,sight)));
@@ -2492,10 +2090,10 @@ vertex Fleck planktonVertex(uint id [[vertex_id]], constant Scene& s [[buffer(0)
     const float suspended = mix(1.,.36+.83*mote.current,s.habitat.y)*(1.-s.cycle.z)*s.basinArrival;
     const float spin = .66+.34*sin(s.screen.y*(.95+glint*.57)+glint*57.);
     const float detail = smoothstep(.91,1.,glint)*spin;
-    return {float4(point/aspect,0,1),uv,colour*depthLight(mote.head.y,s),
+    return {float4(point/aspect,0,1),uv,colour*depthLight(mote.head.y,s)+1.8*searchlightAt(mote.head.xyz,s)*searchlightColour,
             mote.tail.w*fade*suspended*(paintedWorld ? .62 : 1.+.48*s.music.z+.19*s.music.w),detail};
 }
-fragment half4 planktonFragment(Fleck in [[stage_in]],
+fragment half4 planktonFragment(Fleck in [[stage_in]], constant Scene& s [[buffer(0)]],
                                 texture2d<half,access::read> transmission [[texture(2)]]) {
     const float cross = in.uv.x*2.-1.;
     const float along = in.uv.y;
@@ -2505,7 +2103,8 @@ fragment half4 planktonFragment(Fleck in [[stage_in]],
     const float bead = exp(-dot(offset,offset))*in.detail*edge;
     const float light = in.spark*flowTransmission(in.p,transmission);
     const float opacity = (body*.63+bead*.22)*light;
-    return half4(half3(in.hue*1.29*opacity+mix(in.hue,float3(1.,.91,.68),.28)*bead*light*.82),
+    return half4(half3(bubbleChroma(in.hue*1.29*opacity+mix(in.hue,float3(1.,.91,.68),.28)*bead*light*.82,
+                                  s.interiorPalette)),
                  half(opacity));
 }
 
@@ -2518,7 +2117,7 @@ float3 grade(float3 x) {
 }
 
 float3 gradeHybrid(float3 light) {
-    const float3 colour = grade(light*1.32);
+    const float3 colour = grade(light*1.17);
     const float luminance = dot(colour,float3(.213,.715,.072));
     const float3 chroma = colour-luminance;
     const float peak = max(colour.r,max(colour.g,colour.b));
@@ -2569,30 +2168,122 @@ fragment half4 spreadGlow(Full in [[stage_in]], texture2d<half> nearGlow [[textu
     return half4(half3(soft),1);
 }
 
-fragment half4 upscaleFrame(Full in [[stage_in]], texture2d<half> colour [[texture(0)]]) {
+float3 sampleOceanDetail(texture2d<half> light,float2 uv) {
     constexpr sampler linear(coord::normalized,address::clamp_to_edge,filter::linear);
-    return colour.sample(linear,in.uv);
+    const float2 size = float2(light.get_width(),light.get_height());
+    const float2 texel = uv*size-.5;
+    const float2 base = floor(texel);
+    const float2 t = texel-base;
+    const float2 t2 = t*t, t3 = t2*t;
+    const float2 lowWeight = -.5*t+t2-.5*t3;
+    const float2 highWeight = .5*(t3-t2);
+    const float2 centreWeight = 1.-lowWeight-highWeight;
+    const float2 centreMix = (.5*t+2.*t2-1.5*t3)/centreWeight;
+    const float2 centre = (base+.5+centreMix)/size;
+    const float2 low = (base-.5)/size, high = (base+2.5)/size;
+    // Fold the central Catmull–Rom taps into bilinear fetches and omit the faint diagonal lobes.
+    const float3 middle = float3(light.sample(linear,centre).rgb);
+    const float3 left = float3(light.sample(linear,float2(low.x,centre.y)).rgb);
+    const float3 right = float3(light.sample(linear,float2(high.x,centre.y)).rgb);
+    const float3 above = float3(light.sample(linear,float2(centre.x,low.y)).rgb);
+    const float3 below = float3(light.sample(linear,float2(centre.x,high.y)).rgb);
+    const float total = centreWeight.x*centreWeight.y+(lowWeight.x+highWeight.x)*centreWeight.y+
+                        (lowWeight.y+highWeight.y)*centreWeight.x;
+    const float3 detail = ((left-middle)*lowWeight.x+(right-middle)*highWeight.x)*centreWeight.y+
+                          ((above-middle)*lowWeight.y+(below-middle)*highWeight.y)*centreWeight.x;
+    const float3 minimum = min(middle,min(min(left,right),min(above,below)));
+    const float3 maximum = max(middle,max(max(left,right),max(above,below)));
+    return clamp(middle+detail/total,minimum,maximum);
+}
+
+float finishLens(float radiusSquared) {
+    return .977+.040*radiusSquared;
+}
+
+float3 flightMarker(float3 colour, float2 uv, constant Scene& s, float4 guide) {
+    if (guide.w == 0.) return colour;
+    const bool region = guide.w < 0.;
+    const bool locked = !region && s.lockedPassage != 0u;
+    const float3 clip = projectWorld(guide.xyz,s);
+    if (!region && clip.z < .15) return colour;
+    const float2 projected = clip.z >= .15 ? clip.xy/clip.z :
+        float2(clip.x < 0. ? -.92 : .92,clamp(clip.y/max(1.,abs(clip.z)),-.55,.55));
+    const float2 centre = clamp(projected,float2(-.92,-.88),float2(.92,.88));
+    const float2 local = (uv*float2(2.,-2.)+float2(-1.,1.)-centre)*float2(s.screen.x,1.);
+    const float d = length(local);
+    const float diagonal = min(abs(local.x),abs(local.y))/max(.0001,d);
+    const float arc = locked ? 1. : smoothstep(.31,.45,diagonal);
+    const float edge = max(.001,fwidth(d)*.54);
+    const float square = max(abs(local.x),abs(local.y));
+    const float ring = locked ? min(abs(square-.022),max(abs(local.y),abs(local.x)-.022)) :
+                                abs(d-(region ? .040 : .026));
+    const float outline = 1.-smoothstep(.0047,.0047+edge,ring);
+    const float line = 1.-smoothstep(.0018,.0018+edge*.77,ring);
+    const float opacity = abs(guide.w)*(region ? 1. : smoothstep(.15,.64,clip.z));
+    const float3 tinted = mix(colour,float3(.019,.040,.051),opacity*outline*arc*.73);
+    const float3 ink = region || locked ? float3(.98,.80,.38) : float3(.86,.985,.97);
+    return mix(tinted,ink,opacity*line*arc*.91);
+}
+
+float3 pulseWavefront(float3 colour, float2 uv, constant Scene& s,
+                      texture2d<half,access::read> hull, texture2d<half,access::read> hullRange) {
+    const float lifetime = s.pulseAxis.w;
+    if (lifetime <= 0. || s.innerOcean.z > 0. || s.cycle.y > 0. || s.cycle.w > .001) return colour;
+    const float age = s.screen.z, radius = age*s.call.z;
+    const float strength = smoothstep(.038,.18,age)*(1.-smoothstep(.60*lifetime,lifetime,age));
+    if (strength <= 0.) return colour;
+    const float2 q = (uv*float2(2.,-2.)+float2(-1.,1.))*float2(s.screen.x,1.);
+    const float3 ray = normalize(s.forward.xyz+(q.x*s.right.xyz+q.y*s.up.xyz)/focal);
+    const float3 offset = s.player.xyz-s.eye.xyz;
+    const float centre = dot(ray,offset);
+    const float impact = length(cross(ray,offset));
+    const float root = radius*radius-impact*impact;
+    const float travel = centre+sqrt(max(0.,root));
+    const float3 normal = (ray*travel-offset)/max(.01,radius);
+    const float latitude = dot(normal,s.pulseAxis.xyz);
+
+    // Keep the ripple on the advancing front of the sphere.
+    const float front = step(0.,root)*smoothstep(.15,.65,travel);
+    const float ripple = sin(dot(normal,float3(13.,7.,-6.))+age*3.6);
+    const float edge = abs(latitude-(.943+.0014*ripple));
+    const float width = clamp(.70*fwidth(latitude),.00055,.0028);
+    const float crest = front*(1.-smoothstep(.00085,.00175+width,edge));
+    const float halo = front*exp2(-3.3*powr(edge/.012,2.));
+    if (crest+halo <= .001) return colour;
+
+    const float depth = max(.1,travel)*dot(ray,s.forward.xyz);
+    const float2 hullSize = float2(hull.get_width(),hull.get_height());
+    const uint2 pixel = uint2(clamp(uv,0.,.99999)*hullSize);
+    const float seen = strength*hullTransmission(depth,pixel,hull,hullRange);
+    const float3 corona = mix(colour,float3(.13,.50,.57),seen*halo*.22);
+    return mix(corona,float3(.54,.87,.90),seen*crest*(.48+.08*ripple));
 }
 
 fragment half4 finish(Full in [[stage_in]], constant Scene& s [[buffer(0)]],
+                      constant float4& guide [[buffer(1)]],
                       texture2d<half> light [[texture(0)]],
                       texture2d<half> nearGlow [[texture(1)]],
-                      texture2d<half> farGlow [[texture(2)]]) {
+                      texture2d<half> farGlow [[texture(2)]],
+                      texture2d<half,access::read> hull [[texture(3)]],
+                      texture2d<half,access::read> hullRange [[texture(4)]]) {
     constexpr sampler sampleLight(coord::normalized,address::clamp_to_edge,filter::linear);
     const float2 q = in.uv-.5;
     const float lens = dot(q,q);
     if (s.graphicsStyle == paintedGraphics) {
-        const float3 coat = float3(light.sample(sampleLight,in.uv).rgb);
-        return half4(half3(finishPaint(coat,in.p.xy)),1);
+        const float3 coat = sampleOceanDetail(light,in.uv);
+        const float3 tinted = pulseWavefront(finishPaint(coat,in.p.xy),in.uv,s,hull,hullRange);
+        return half4(half3(flightMarker(tinted,in.uv,s,guide)),1);
     }
-    const float2 uv = .5 + q*(.977+.040*lens);
-    float3 c = float3(light.sample(sampleLight,uv).rgb);
-    // Keep colour separation on the bell lenses, where it follows the material.
-    c += float3(nearGlow.sample(sampleLight,uv).rgb)*.22+
-         float3(farGlow.sample(sampleLight,uv).rgb)*.16;
+    const float2 uv = .5 + q*finishLens(lens);
+    const bool ultra = s.graphicsStyle == ultraGraphics;
+    float3 c = ultra ? float3(light.sample(sampleLight,uv).rgb) : sampleOceanDetail(light,uv);
+    // Keep the glow tight enough to leave dark water between bubbles.
+    c += float3(nearGlow.sample(sampleLight,uv).rgb)*(ultra ? .17 : .11)+
+         float3(farGlow.sample(sampleLight,uv).rgb)*(ultra ? .12 : .048);
     c *= 1.-.27*smoothstep(.11,.50,lens);
     const float grain = (hash21(in.p.xy)-.5)*.006;
     const float grainAmount = 1.-smoothstep(.69,1.,max(c.r,max(c.g,c.b)));
     c = (hybridWater(s) ? gradeHybrid(c) : grade(c))+grain*grainAmount;
-    return half4(half3(c),1);
+    c = pulseWavefront(c,uv,s,hull,hullRange);
+    return half4(half3(flightMarker(c,uv,s,guide)),1);
 }

@@ -1,4 +1,5 @@
 #include "Score.hpp"
+#include "BubbleStrings.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -128,6 +129,28 @@ void Score::echo(const Reply& reply, Vec listener, Vec right, Vec forward) {
     const char* instrument = reply.crown ? "pelagic_reply" : "bell";
     scae_note(engine.get(),instrument,roots[palette]+interval,reply.crown ? (close ? .34f : .57f) : .30f,
               reply.crown ? (close ? 2.1f : 3.2f) : 1.75f,31.5f+29.f*pan,31.5f,spatial,3);
+}
+
+void Score::chime(const BubbleChime& chime,Vec listener,Vec right,Vec forward,float mixLevel) {
+    if (!engine) return;
+    constexpr std::array<float,regionScales> keys{55.f,57.f,52.f,53.f,50.f,48.f};
+    constexpr std::array<float,7> scale{0.f,2.f,3.f,7.f,10.f,12.f,14.f};
+    constexpr std::array<float,8> figure{0.f,7.f,12.f,3.f,10.f,14.f,7.f,2.f};
+    const Vec offset=chime.position-listener;
+    const float distance=std::max(.01f,std::hypot(offset.x,offset.y,offset.z));
+    const float pan=(offset.x*right.x+offset.y*right.y+offset.z*right.z)/distance;
+    const float front=(offset.x*forward.x+offset.y*forward.y+offset.z*forward.z)/distance;
+    const bool melody=chime.sequenceLength!=0, final=melody && chime.step+1==chime.sequenceLength;
+    const bool region=chime.bubble.kind==BubbleKind::Region;
+    const float root=keys[std::min<std::size_t>(chime.layer,keys.size()-1)];
+    const float degree=melody ? (final ? 12.f : figure[chime.step%figure.size()]) :
+                                scale[chime.bubble.id%scale.size()]+(region ? -12.f : 5.f);
+    const float gain=melody ? .88f/(1.f+.007f*distance) : mixLevel/(1.f+.035f*distance);
+    const scae_parameter spatial[]{{"distance",melody ? .20f*distance : distance},
+                                   {"behind",std::max(0.f,-front)*(melody ? .28f : 1.f)},{"spatialgain",gain}};
+    scae_note(engine.get(),"bell",root+degree,melody ? (final ? .44f : .32f) : .24f,
+              melody ? (final ? 2.9f : 1.35f) : (region ? 1.45f : .80f),
+              31.5f+(melody ? 19.f : 27.f)*std::clamp(pan,-1.f,1.f),31.5f,spatial,3);
 }
 
 void Score::mute(bool muted) {

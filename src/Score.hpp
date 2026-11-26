@@ -7,6 +7,8 @@
 
 namespace pelagic {
 
+struct BubbleChime;
+
 class Score {
 public:
     static constexpr unsigned sampleRate = 48000;
@@ -19,6 +21,7 @@ public:
     void resonateBell(unsigned contraction);
     void play(VoyageCue cue);
     void echo(const Reply& reply, Vec listener, Vec right, Vec forward);
+    void chime(const BubbleChime&, Vec listener, Vec right, Vec forward, float mixLevel);
     void mute(bool muted);
     std::uint64_t spectrum() const { return analysis.snapshot(); }
 private:
